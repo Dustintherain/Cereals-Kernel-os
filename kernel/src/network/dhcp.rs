@@ -67,7 +67,12 @@ const XID: u32 = 0x4345_524C; // "CERL"
 ///
 /// 固定请求广播应答（flags bit15）：OFFER 会以广播帧回来，网卡一定能收到。
 pub fn build_discover(buf: &mut [u8], mac: [u8; 6]) -> usize {
-    let len = buf.len().min(MESSAGE_LEN);
+    // 下面的写入固定在 0..248 范围内（BOOTP 头 + cookie + 选项）；缓冲比最小报文
+    // 还短时不能“写完再说”，直接返回 0 让调用方报错。
+    if buf.len() < MESSAGE_LEN {
+        return 0;
+    }
+    let len = MESSAGE_LEN;
     buf[..len].fill(0);
     buf[0] = OP_REQUEST;
     buf[1] = HTYPE_ETHERNET;

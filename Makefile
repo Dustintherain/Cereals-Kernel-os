@@ -559,8 +559,9 @@ test-ahci: image fat-image
 #     （`--tcp-echo-port` 在测试侧起，QEMU 把客户机对 10.0.2.2:18080 的连接转给它），
 #     发 12 字节、逐字节收回比对、FIN 完整关闭 —— TCP 是「真握手 + 真字节」；
 #   - `tcpecho: PASS` + `user: tcpecho PASS`：`/bin/tcpecho` 走用户态 socket syscall
-#     （`socket/connect/sendto/recvfrom` + `write/read` 两轮）与同一回声服务收发成功 ——
-#     syscall 路径与内核自测是同一套 TCP 代码（`network::tcp`），两条证据互相印证。
+#     （`sendto/recvfrom` + `write/read` 两轮，外加 3000 B 超 MSS 载荷用 512 B 小缓冲读的第三轮）
+#     与同一回声服务收发成功 —— syscall 路径与内核自测是同一套 TCP 代码（`network::tcp`），
+#     两条证据互相印证。
 test-network: image
 	$(PYTHON) tests/test_boot.py \
 		--nic \
@@ -587,6 +588,7 @@ test-network: image
 		--expect "tcpecho: connected 10.0.2.2:18080" \
 		--expect "tcpecho: round 1 sendto/recvfrom PASS" \
 		--expect "tcpecho: round 2 write/read PASS" \
+		--expect "tcpecho: round 3 large payload PASS len=3000" \
 		--expect "tcpecho: PASS" \
 		--expect "user: tcpecho PASS"
 

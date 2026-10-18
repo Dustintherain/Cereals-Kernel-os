@@ -49,7 +49,7 @@ L /lib/ld.so    ld.so               # L = 被装载对象（解释器 / 共享�
 | `user/hello-bin/` | 外部程序（`/bin/hello`）：由 Shell `fork` + `execve` 起来，打印 PID 与 `argv` |
 | `user/{ls,cat,echo,ps}/` | coreutils：`getdents` / 文件 syscall / `write` / `getprocs` |
 | `user/volumes/` | 存储卷枚举（`/bin/volumes`）：`storage_volumes`（CSS-1），打印卷表（`id`/`disk`/`part`/`fs`/`label`/`health`/`mounts`） |
-| `user/tcpecho/` | TCP 回显验收（`/bin/tcpecho`）：`connect` 连宿主回声服务，两轮往返分别走 `sendto`/`recvfrom` 与 `write`/`read`（v1.0 socket/TCP 补齐） |
+| `user/tcpecho/` | TCP 回显验收（`/bin/tcpecho`）：`connect` 连宿主回声服务，两轮往返分别走 `sendto`/`recvfrom` 与 `write`/`read`，第三轮 3000 B 超 MSS 载荷用 512 B 小缓冲读（v1.0 socket/TCP 补齐） |
 | `user/dynhello/` | 动态链接夹具（`as`+`ld` 现编）：`dynhello` + `libgreet.so` + `ld.so` |
 | `user/init/` | v0.9 占位（2 行）；真正的 `/init` 是 `user/hello` 的产物 |
 | `tools/check_dyn_fixture.py` | 动态链接夹具结构自检（ET_DYN + `PT_INTERP` + `DT_NEEDED`） |

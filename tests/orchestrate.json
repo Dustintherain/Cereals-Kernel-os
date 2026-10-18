@@ -729,6 +729,7 @@
         "--expect", "net: tcp PASS",
         "--expect", "tcpecho: round 1 sendto/recvfrom PASS",
         "--expect", "tcpecho: round 2 write/read PASS",
+        "--expect", "tcpecho: round 3 large payload PASS len=3000",
         "--expect", "tcpecho: PASS",
         "--expect", "user: tcpecho PASS",
         "--expect", "net: selftest PASS"
@@ -744,6 +745,7 @@
         "net: dhcp PASS",
         "net: tcp connect 10.0.2.2:18080 ESTABLISHED",
         "net: tcp PASS",
+        "tcpecho: round 3 large payload PASS len=3000",
         "tcpecho: PASS",
         "user: tcpecho PASS",
         "net: selftest PASS"

@@ -59,6 +59,13 @@ const RECV_TIMEOUT_TICKS: u64 = 300;
 const CLOSE_TIMEOUT_TICKS: u64 = 400;
 /// ARP 解析等待上限（与 [`crate::network::Stack`] 的 ARP 超时一致）。
 const ARP_TIMEOUT_TICKS: u64 = 100;
+/// 每连接接收缓冲容量（字节）。
+///
+/// 为什么需要它：`send` 等待某一段的 ACK 时，对端可能已经在回数据
+///（echo/请求-应答协议）。这些字节必须按序留在连接里等 `recv` 取走，
+/// 不能“收下并 ACK 后丢掉” —— 那会让字节流出现空洞。容量取 4 KiB
+///（≥ 2 个 MSS），足以覆盖一次往返里对端能塞进来的数据。
+const RX_CAP: usize = 4096;
 
 /// TCP 路径的失败（调用方按它换 errno：超时与拒绝是两种不同的事实）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,8 +74,6 @@ pub enum Error {
     Timeout,
     /// 对端 RST → `-ECONNREFUSED`。
     Refused,
-    /// 对端已 FIN，而调用方还要发送 → `-EIO`（ABI 尚无 EPIPE，用它表示「连接已半关」）。
-    Closed,
 }
 
 impl Error {
@@ -77,7 +82,6 @@ impl Error {
         match self {
             Error::Timeout => abi::errno::ETIMEDOUT,
             Error::Refused => abi::errno::ECONNREFUSED,
-            Error::Closed => abi::errno::EIO,
         }
     }
 
@@ -86,7 +90,6 @@ impl Error {
         match self {
             Error::Timeout => "timeout",
             Error::Refused => "refused",
-            Error::Closed => "closed",
         }
     }
 }
@@ -110,6 +113,33 @@ pub struct Conn {
     pub snd_una: u32,
     /// 下一个期望收到的序号。
     pub rcv_nxt: u32,
+    /// 已收到、尚未交付给调用方的字节（FIFO；`rx[..rx_len]` 有效）。
+    pub rx: [u8; RX_CAP],
+    /// `rx` 里的有效字节数。
+    pub rx_len: usize,
+    /// 对端已发 FIN：此后 `recv` 立即返回 0，`close` 不必再等对端 FIN。
+    pub peer_closed: bool,
+}
+
+/// 把 `data` 追加到接收 FIFO；装不下返回 `false`（调用方不得推进 `rcv_nxt`，
+/// 让对端按自己的重传节奏再来一次，而不是把半段数据拼进流里）。
+fn rx_push(conn: &mut Conn, data: &[u8]) -> bool {
+    if conn.rx_len + data.len() > RX_CAP {
+        return false;
+    }
+    let end = conn.rx_len + data.len();
+    conn.rx[conn.rx_len..end].copy_from_slice(data);
+    conn.rx_len = end;
+    true
+}
+
+/// 从接收 FIFO 取最多 `out.len()` 字节，返回实际取出的字节数。
+fn rx_pop(conn: &mut Conn, out: &mut [u8]) -> usize {
+    let n = conn.rx_len.min(out.len());
+    out[..n].copy_from_slice(&conn.rx[..n]);
+    conn.rx.copy_within(n..conn.rx_len, 0);
+    conn.rx_len -= n;
+    n
 }
 
 /// 收到的一个匹配段（载荷已拷进调用方缓冲）。
@@ -383,6 +413,9 @@ pub fn connect(
                 snd_nxt: iss.wrapping_add(1),
                 snd_una: seg.ack,
                 rcv_nxt: seg.seq.wrapping_add(1),
+                rx: [0u8; RX_CAP],
+                rx_len: 0,
+                peer_closed: false,
             };
             send_ack(dev, &conn, src_mac, next_id)?;
             return Ok(conn);
@@ -392,69 +425,93 @@ pub fn connect(
     Err(Error::Timeout)
 }
 
-/// 发送全部 `data`（按 MSS 切块，每块等累积 ACK；对端数据/重传的纯 ACK 推进 `snd_una`）。
+/// 发送 `data`（按 MSS 切块，每块等累积 ACK）。
+///
+/// 返回**已确认的字节数**：中途失败时可能是 `Ok(sent)`（`0 < sent < data.len()`），
+/// 调用方（`socket::send`）原样把它交给用户态，避免“报错但前几段已送达”被重发成重复数据。
+/// 只有一段都没发出去时才返回 `Err`。
 pub fn send(
     conn: &mut Conn,
     dev: &mut dyn NetworkDevice,
     src_mac: [u8; 6],
     next_id: &mut u16,
     mut data: &[u8],
-) -> Result<(), Error> {
+) -> Result<usize, Error> {
+    let mut sent = 0usize;
     while !data.is_empty() {
         let chunk_len = data.len().min(MSS);
         let (chunk, rest) = data.split_at(chunk_len);
         let mut attempt = 0;
-        loop {
+        let mut acked = false;
+        while !acked {
             if attempt >= DATA_ATTEMPTS {
-                return Err(Error::Timeout);
+                return if sent > 0 { Ok(sent) } else { Err(Error::Timeout) };
             }
             attempt += 1;
-            send_segment(
+            if let Err(err) = send_segment(
                 dev, src_mac, conn.remote_mac, conn.local_ip, conn.remote_ip, next_id,
                 conn.local_port, conn.remote_port, conn.snd_nxt, conn.rcv_nxt,
                 FLAG_PSH | FLAG_ACK, chunk,
-            )?;
-            let mut tmp = [0u8; MSS];
-            let Some(seg) = recv_match(
-                dev,
-                &mut tmp,
-                DATA_TIMEOUT_TICKS,
-                conn.local_ip,
-                conn.local_port,
-                conn.remote_ip,
-                conn.remote_port,
-            ) else {
-                continue; // 超时 → 重传本块
-            };
-            if seg.flags & FLAG_RST != 0 {
-                return Err(Error::Refused);
+            ) {
+                return if sent > 0 { Ok(sent) } else { Err(err) };
             }
-            if seg.flags & FLAG_FIN != 0 && seg.seq == conn.rcv_nxt {
-                // 对端在确认前就 FIN：先 ACK 它的关闭，再报发送失败
-                conn.rcv_nxt = conn.rcv_nxt.wrapping_add(seg.len as u32).wrapping_add(1);
-                let _ = send_ack(dev, conn, src_mac, next_id);
-                return Err(Error::Closed);
+            // 一次 attempt 的总等待上限：不能因为对端持续发重复 ACK 就无限等下去。
+            let attempt_start = ticks();
+            loop {
+                let elapsed = ticks().wrapping_sub(attempt_start);
+                if elapsed >= DATA_TIMEOUT_TICKS {
+                    break; // 本轮超时 → 重传本块
+                }
+                let mut tmp = [0u8; MSS];
+                let Some(seg) = recv_match(
+                    dev,
+                    &mut tmp,
+                    DATA_TIMEOUT_TICKS - elapsed,
+                    conn.local_ip,
+                    conn.local_port,
+                    conn.remote_ip,
+                    conn.remote_port,
+                ) else {
+                    break; // 超时 → 重传本块
+                };
+                if seg.flags & FLAG_RST != 0 {
+                    return if sent > 0 { Ok(sent) } else { Err(Error::Refused) };
+                }
+                // 对端抢发的数据：按序收进接收 FIFO 并 ACK（不能收下就丢）。
+                if seg.len > 0 && seg.seq == conn.rcv_nxt {
+                    if rx_push(conn, &tmp[..seg.len]) {
+                        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(seg.len as u32);
+                        if seg.flags & FLAG_FIN != 0 {
+                            conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+                            conn.peer_closed = true;
+                        }
+                    }
+                    // 缓冲满时只 ACK 已收下的部分（不推进），对端会按自己的重传节奏再来。
+                    let _ = send_ack(dev, conn, src_mac, next_id);
+                } else if seg.flags & FLAG_FIN != 0 && seg.seq == conn.rcv_nxt {
+                    // 对端在确认本块之前就半关闭：TCP 允许继续单向发送，收下 FIN 即可。
+                    conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+                    conn.peer_closed = true;
+                    let _ = send_ack(dev, conn, src_mac, next_id);
+                }
+                if seg.flags & FLAG_ACK != 0
+                    && seg.ack.wrapping_sub(conn.snd_nxt) >= chunk_len as u32
+                {
+                    conn.snd_una = seg.ack;
+                    conn.snd_nxt = conn.snd_nxt.wrapping_add(chunk_len as u32);
+                    sent += chunk_len;
+                    acked = true;
+                    break;
+                }
+                // 纯重复 ACK / 未覆盖本块 → 本轮剩余时间内继续等（不额外重传）
             }
-            // 迟到的数据段（对端抢发）：按序就收下并 ACK，不干扰本块的等待
-            if seg.len > 0 && seg.seq == conn.rcv_nxt && seg.flags & FLAG_FIN == 0 {
-                conn.rcv_nxt = conn.rcv_nxt.wrapping_add(seg.len as u32);
-                let _ = send_ack(dev, conn, src_mac, next_id);
-            }
-            if seg.flags & FLAG_ACK != 0
-                && seg.ack.wrapping_sub(conn.snd_nxt) >= chunk_len as u32
-            {
-                conn.snd_una = seg.ack;
-                conn.snd_nxt = conn.snd_nxt.wrapping_add(chunk_len as u32);
-                break;
-            }
-            // 纯重复 ACK / 未覆盖本块 → 本轮剩余时间内继续等（不额外重传）
         }
         data = rest;
     }
-    Ok(())
+    Ok(sent)
 }
 
-/// 收最多 `out.len()` 字节（首个按序数据段到达即返回；`Ok(0)` = 对端有序关闭）。
+/// 收最多 `out.len()` 字节（有已到达的字节立即返回；`Ok(0)` = 对端有序关闭）。
 pub fn recv_upto(
     conn: &mut Conn,
     dev: &mut dyn NetworkDevice,
@@ -463,6 +520,14 @@ pub fn recv_upto(
     out: &mut [u8],
 ) -> Result<usize, Error> {
     if out.is_empty() {
+        return Ok(0);
+    }
+    // 1) 先交付 `send` 期间收下的字节（它们已经 ACK 过，不能再丢）。
+    if conn.rx_len > 0 {
+        return Ok(rx_pop(conn, out));
+    }
+    // 2) 对端已 FIN：EOF 是粘性的，重复 recv 仍返回 0，而不是重新等一个不会再来的 FIN。
+    if conn.peer_closed {
         return Ok(0);
     }
     let start = ticks();
@@ -492,15 +557,22 @@ pub fn recv_upto(
             continue;
         }
         if seg.len > 0 {
-            let n = seg.len.min(out.len());
-            out[..n].copy_from_slice(&tmp[..n]);
+            // 整段先入 FIFO 再推进序号：`rx_push` 失败时绝不半收。
+            if !rx_push(conn, &tmp[..seg.len]) {
+                let _ = send_ack(dev, conn, src_mac, next_id);
+                continue;
+            }
             conn.rcv_nxt = conn.rcv_nxt.wrapping_add(seg.len as u32);
+            if seg.flags & FLAG_FIN != 0 {
+                conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+                conn.peer_closed = true;
+            }
             send_ack(dev, conn, src_mac, next_id)?;
-            // 数据段捎带 FIN：序号已推进，CLOSE 时会对端已关闭（对方 close 的 FIN 在数据后）
-            return Ok(n);
+            return Ok(rx_pop(conn, out));
         }
         if seg.flags & FLAG_FIN != 0 {
             conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+            conn.peer_closed = true;
             let _ = send_ack(dev, conn, src_mac, next_id);
             return Ok(0); // 有序关闭：读到 EOF
         }
@@ -523,7 +595,9 @@ pub fn close(
     conn.snd_nxt = conn.snd_nxt.wrapping_add(1);
     let start = ticks();
     let mut fin_acked = false;
-    let mut fin_seen = false;
+    // 对端的 FIN 可能已经在 `send`/`recv` 期间收下（`peer_closed`）：
+    // 那就只需要等自己的 FIN 被 ACK，不必再等一个不会重发的 FIN（否则白等 4 秒）。
+    let mut fin_seen = conn.peer_closed;
     loop {
         if ticks().wrapping_sub(start) > CLOSE_TIMEOUT_TICKS {
             // FIN 已确认但对端 FIN 迟迟不来：半关闭亦可接受（对端进程已退出）

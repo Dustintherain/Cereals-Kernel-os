@@ -92,7 +92,9 @@ pub fn load(space: &mut UserSpace, elf: &[u8]) -> Result<LoadStats, i64> {
     let mut writable_pages = 0u32;
     let mut bytes = 0u64;
     for seg in &segments {
-        bytes += seg.memsz;
+        bytes = bytes
+            .checked_add(seg.memsz)
+            .ok_or_else(|| reject("segment size overflow"))?;
         let start = align_down(seg.vaddr, PAGE_SIZE);
         let end = align_up(seg.vaddr + seg.memsz, PAGE_SIZE);
         let mut page = start;
@@ -109,7 +111,11 @@ pub fn load(space: &mut UserSpace, elf: &[u8]) -> Result<LoadStats, i64> {
             let copy_end = (seg.vaddr + seg.filesz).min(page + PAGE_SIZE);
             if copy_start < copy_end {
                 let in_page = (copy_start - page) as usize;
-                let file_at = (seg.offset + (copy_start - seg.vaddr)) as usize;
+                let file_at = seg
+                    .offset
+                    .checked_add(copy_start - seg.vaddr)
+                    .ok_or_else(|| reject("segment file offset overflow"))?
+                    as usize;
                 let len = (copy_end - copy_start) as usize;
                 // SAFETY: 物理帧由本空间拥有；内核 CR3 下物理地址恒等可写
                 unsafe {
@@ -161,19 +167,19 @@ fn parse_header(elf: &[u8]) -> Result<Header, i64> {
         return Err(reject("not little-endian (EI_DATA)"));
     }
     // e_type：ET_EXEC = 2（PIE/ET_DYN 需要加载时重定位，v0.7 不支持）
-    let e_type = u16_at(elf, 16).expect("header size checked");
+    let e_type = u16_at(elf, 16).ok_or_else(|| reject("bad e_type"))?;
     if e_type != 2 {
         return Err(reject("not ET_EXEC (link with -C relocation-model=static)"));
     }
     // e_machine：EM_X86_64 = 62
-    let e_machine = u16_at(elf, 18).expect("header size checked");
+    let e_machine = u16_at(elf, 18).ok_or_else(|| reject("bad e_machine"))?;
     if e_machine != 62 {
         return Err(reject("not x86_64"));
     }
-    let entry = u64_at(elf, 24).expect("header size checked");
-    let phoff = u64_at(elf, 32).expect("header size checked");
-    let phentsize = u16_at(elf, 54).expect("header size checked");
-    let phnum = u16_at(elf, 56).expect("header size checked");
+    let entry = u64_at(elf, 24).ok_or_else(|| reject("bad e_entry"))?;
+    let phoff = u64_at(elf, 32).ok_or_else(|| reject("bad e_phoff"))?;
+    let phentsize = u16_at(elf, 54).ok_or_else(|| reject("bad e_phentsize"))?;
+    let phnum = u16_at(elf, 56).ok_or_else(|| reject("bad e_phnum"))?;
     if phentsize as usize != PHDR_SIZE {
         return Err(reject("unexpected program header size"));
     }
@@ -182,6 +188,15 @@ fn parse_header(elf: &[u8]) -> Result<Header, i64> {
     }
     if !within_image(entry) {
         return Err(reject("entry point outside user image window"));
+    }
+    // 程序头表必须整段落在文件内（`phoff + phnum*phentsize` 用 checked，
+    // 否则畸形文件的一次溢出就能让后面的解析越界或直接 panic）。
+    let table_len = (phnum as u64)
+        .checked_mul(phentsize as u64)
+        .and_then(|n| phoff.checked_add(n))
+        .ok_or_else(|| reject("program header table overflow"))?;
+    if table_len > elf.len() as u64 {
+        return Err(reject("program headers outside file"));
     }
     Ok(Header {
         entry,
@@ -194,25 +209,34 @@ fn parse_header(elf: &[u8]) -> Result<Header, i64> {
 /// 建 `PT_LOAD` 段表（同时完成全部边界校验）。
 fn parse_segments(elf: &[u8], phoff: u64, phentsize: u16, phnum: u16) -> Result<Vec<Segment>, i64> {
     let phoff = phoff as usize;
+    let ehentry = phentsize as usize;
     let mut segments = Vec::new();
     for i in 0..phnum as usize {
-        let ph = phoff + i * phentsize as usize;
-        if ph + PHDR_SIZE > elf.len() {
+        // 头部已经保证整张表在文件内；这里仍用 checked 算子，"绝不 panic"
+        // 这条约束不能依赖调用方（畸形 ELF 是正常的输入）。
+        let ph = i
+            .checked_mul(ehentry)
+            .and_then(|n| phoff.checked_add(n))
+            .ok_or_else(|| reject("program header offset overflow"))?;
+        if ph.checked_add(PHDR_SIZE).map_or(true, |end| end > elf.len()) {
             return Err(reject("program header outside file"));
         }
-        if u32_at(elf, ph).expect("bounds checked") != PT_LOAD {
+        if u32_at(elf, ph).ok_or_else(|| reject("bad program header"))? != PT_LOAD {
             continue;
         }
-        let flags = u32_at(elf, ph + 4).expect("bounds checked");
-        let offset = u64_at(elf, ph + 8).expect("bounds checked");
-        let vaddr = u64_at(elf, ph + 16).expect("bounds checked");
-        let filesz = u64_at(elf, ph + 32).expect("bounds checked");
-        let memsz = u64_at(elf, ph + 40).expect("bounds checked");
+        let flags = u32_at(elf, ph + 4).ok_or_else(|| reject("bad PT_LOAD flags"))?;
+        let offset = u64_at(elf, ph + 8).ok_or_else(|| reject("bad PT_LOAD offset"))?;
+        let vaddr = u64_at(elf, ph + 16).ok_or_else(|| reject("bad PT_LOAD vaddr"))?;
+        let filesz = u64_at(elf, ph + 32).ok_or_else(|| reject("bad PT_LOAD filesz"))?;
+        let memsz = u64_at(elf, ph + 40).ok_or_else(|| reject("bad PT_LOAD memsz"))?;
 
         if filesz > memsz {
             return Err(reject("PT_LOAD p_filesz > p_memsz"));
         }
-        if offset + filesz > elf.len() as u64 {
+        let file_end = offset
+            .checked_add(filesz)
+            .ok_or_else(|| reject("PT_LOAD offset overflow"))?;
+        if file_end > elf.len() as u64 {
             return Err(reject("PT_LOAD extends past end of file"));
         }
         if !within_image(vaddr) {
@@ -244,20 +268,29 @@ fn parse_segments(elf: &[u8], phoff: u64, phentsize: u16, phnum: u16) -> Result<
 /// 与 `kernel/build.rs` 的构建期断言同一条件；构建期拦在编译阶段，这里再拦一次
 /// 运行期（例如程序来自别处、或链接脚本被改坏）。
 fn check_alloc_free(elf: &[u8]) -> Result<(), i64> {
-    let shoff = u64_at(elf, 40).expect("header size checked");
-    let shentsize = u16_at(elf, 58).expect("header size checked") as usize;
-    let shnum = u16_at(elf, 60).expect("header size checked") as usize;
+    let shoff = u64_at(elf, 40).ok_or_else(|| reject("bad e_shoff"))?;
+    let shentsize = u16_at(elf, 58).ok_or_else(|| reject("bad e_shentsize"))? as usize;
+    let shnum = u16_at(elf, 60).ok_or_else(|| reject("bad e_shnum"))? as usize;
     if shoff == 0 || shnum == 0 {
         return Ok(()); // 没有节表（strip 过的映像）：没有可装载重定位段
+    }
+    // 节头表同样要整段落在文件内，且条目至少 64 字节（没有这条，`shentsize=0`
+    // 会把每个循环都读到同一个偏移，永远不变）。
+    if shentsize < 64 {
+        return Err(reject("unexpected section header size"));
+    }
+    let table_len = (shnum as u64)
+        .checked_mul(shentsize as u64)
+        .and_then(|n| shoff.checked_add(n))
+        .ok_or_else(|| reject("section header table overflow"))?;
+    if table_len > elf.len() as u64 {
+        return Err(reject("section headers outside file"));
     }
     let shoff = shoff as usize;
     for i in 0..shnum {
         let sh = shoff + i * shentsize;
-        if sh + 64 > elf.len() {
-            return Err(reject("section header outside file"));
-        }
-        let sh_type = u32_at(elf, sh + 4).expect("bounds checked");
-        let sh_flags = u64_at(elf, sh + 8).expect("bounds checked");
+        let sh_type = u32_at(elf, sh + 4).ok_or_else(|| reject("bad section header"))?;
+        let sh_flags = u64_at(elf, sh + 8).ok_or_else(|| reject("bad section flags"))?;
         // SHT_REL = 9, SHT_RELA = 4；SHF_ALLOC = 0x2
         if (sh_type == 4 || sh_type == 9) && sh_flags & 0x2 != 0 {
             return Err(reject("loadable relocations present"));

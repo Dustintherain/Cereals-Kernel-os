@@ -8,7 +8,7 @@
 //! | ---- | ---- |
 //! | 域 / 类型 / 协议 | 只认 `AF_INET` + `SOCK_STREAM` + `IPPROTO_TCP`（其余 `-EAFNOSUPPORT`） |
 //! | fd | [`SOCK_FD_BASE`] 起的独立号段（16..=23），不与文件 fd（0..=15）重叠 |
-//! | 本机地址 | [`crate::network::GUEST_IP`]（slirp 默认租约；DHCP 续租不跟踪，见下） |
+//! | 本机地址 | [`crate::network::local_ip`]（DHCP 租约落地后的地址；未租到时是 slirp 默认值） |
 //! | 本机端口 | `bind` 固定，或 `connect` 时从临时段自动分配 |
 //!
 //! 约束（与文件 fd 表同一模型）：**全局表、一次只服务一个用户程序**，
@@ -73,7 +73,8 @@ static mut NEXT_ID: u16 = 1;
 
 /// 是否为套接字 fd（号段判定；不查表，因此 `EBADF` 与「不是套接字」可区分）。
 pub fn is_socket_fd(fd: i32) -> bool {
-    fd >= SOCK_FD_BASE && (fd - SOCK_FD_BASE) as usize <= MAX_SOCKETS
+    // 严格的半开区间 `[BASE, BASE + MAX_SOCKETS)`：`BASE + MAX_SOCKETS` 本身越界。
+    fd >= SOCK_FD_BASE && ((fd - SOCK_FD_BASE) as usize) < MAX_SOCKETS
 }
 
 /// 槽位下标（调用方已用 [`is_socket_fd`] 确认号段）。
@@ -129,7 +130,8 @@ fn alloc_ephemeral() -> u16 {
 
 /// `socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)`：分配槽位，返回 fd。
 pub fn create(domain: u64, ty: i32, protocol: i32) -> Result<i32, i64> {
-    if domain as u16 != AF_INET {
+    // 必须比较完整的 u64：`domain as u16` 会让 0x1_0002 这种值被截断成 AF_INET。
+    if domain != AF_INET as u64 {
         return Err(EAFNOSUPPORT);
     }
     if ty != SOCK_STREAM {
@@ -212,7 +214,7 @@ pub fn connect(fd: i32, remote_ip: [u8; 4], remote_port: u16) -> Result<(), i64>
     match tcp::connect(
         &mut *dev,
         mac,
-        crate::network::GUEST_IP,
+        crate::network::local_ip(),
         next_id,
         ipv4::Address::from_octets(remote_ip),
         remote_port,
@@ -231,7 +233,7 @@ pub fn connect(fd: i32, remote_ip: [u8; 4], remote_port: u16) -> Result<(), i64>
     }
 }
 
-/// 在已连接套接字上发送全部 `data`，返回发送字节数。
+/// 在已连接套接字上发送 `data`，返回**已确认的字节数**（可能少于 `data.len()`）。
 pub fn send(fd: i32, data: &[u8]) -> Result<usize, i64> {
     if data.is_empty() {
         return Ok(0);
@@ -250,14 +252,16 @@ pub fn send(fd: i32, data: &[u8]) -> Result<usize, i64> {
     let mac = src_mac(&mut *dev);
     let next_id = unsafe { &mut *(&raw mut NEXT_ID) };
     match tcp::send(&mut conn, &mut *dev, mac, next_id, data) {
-        Ok(()) => {
+        // 可能只发出去一部分（对端在中途 RST/超时）：把**已确认**的字节数交回用户态，
+        // 由它决定是否重发剩余部分 —— 报错却丢掉进度会让调用方整段重发成重复数据。
+        Ok(n) => {
             unsafe {
                 let table = (&raw mut TABLE).as_mut().expect("TABLE 是静态量");
                 if let Some(slot) = table.get_mut(idx) {
                     slot.conn = Some(conn);
                 }
             }
-            Ok(data.len())
+            Ok(n)
         }
         Err(err) => {
             // 序号状态已推进（部分段被确认）：写回再报错，不丢确认进度

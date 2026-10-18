@@ -11,7 +11,7 @@
   TCP/ICMP 与 socket、更多用户程序）归 v1.0，其中 **`mprotect` 已于 2026-10-11（v1.0 第一步）落地**：
   已映射页的保护属性可在运行期改写（`PROT_NONE` 与 W^X 的「先写后换只执行」，见 syscall.md 3.10）；
   **Socket/TCP 已于 2026-10-14（v1.0 第三步）落地**：内核 TCP 客户端最小集 + `socket`/`bind`/`connect`/`sendto`/`recvfrom`
- （号 41/42/44/45/49）+ `/bin/tcpecho` 回显往返，`make test-network` 13 → **23 项**（见 syscall.md 3.13）；
+ （号 41/42/44/45/49）+ `/bin/tcpecho` 回显往返，`make test-network` 13 → **24 项**（见 syscall.md 3.13）；
   ICMP（ping）仍待落地；
   **v1.0 之后新增「桌面环境兼容路线」（规划）**：
   D0 地基 → D1 输入 → D2 显示 → D3 音频 → D4 会话/电源 → D5 收尾，见 [desktop.md](desktop.md)；

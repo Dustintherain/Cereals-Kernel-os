@@ -24,36 +24,13 @@ use alloc::vec::Vec;
 use crate::fs::inode::{DirEntry, Metadata};
 
 // ---- errno（与 syscall 约定一致：负数） ----
-
-/// 文件/目录不存在。
-pub const ENOENT: i64 = -2;
-/// 可执行文件格式错误（ELF 装载器拒绝时使用，见 `syscall::elf`）。
-pub const ENOEXEC: i64 = -8;
-/// 内存不足（帧/堆分配失败）。
-pub const ENOMEM: i64 = -12;
-/// 文件描述符无效 / 未打开 / 打开模式与操作不符。
-pub const EBADF: i64 = -9;
-/// 系统调用参数非法（这里是：路径非法）。
-pub const EINVAL: i64 = -22;
-/// 目标已存在。
-pub const EEXIST: i64 = -17;
-/// 目标是目录，但调用方要当文件用。
-pub const EISDIR: i64 = -21;
-/// 路径中间分量不是目录。
-pub const ENOTDIR: i64 = -20;
-/// 空间不足（用在了「文件超过 RAMFS 单文件上限」）。
-pub const ENOSPC: i64 = -28;
-/// 只读文件系统（写操作落到 [`FileSystem::write`] 等写接口上时返回它）。
-pub const EROFS: i64 = -30;
-/// `-EIO`：块设备读写失败。
-pub const EIO: i64 = -5;
-/// `-EUCLEAN`：磁盘上的结构损坏（簇链断/越界、目录项非法）。
-pub const EUCLEAN: i64 = -117;
-/// `-ENODEV`：设备不存在 / 已消失（CSS 追加；让「拔盘」与「坏盘」可区分）。
-pub const ENODEV: i64 = -19;
-/// `-ENOTSUP`：识别到文件系统但内核没有对应后端（CSS 追加；与「路径不存在」区分开：
-/// 盘在、格式不支持）。
-pub const ENOTSUP: i64 = -95;
+//
+// **全部再导出 `abi::errno`**（阶段三的单一事实源）：这里不再各写一份数字。
+// `vfs::E*` 的名字保持不变，已有调用点不用改；数值只在内核与 libc 共享的 ABI 里定义一次。
+pub use abi::errno::{
+    EBADF, EEXIST, EIO, EISDIR, EINVAL, ENOENT, ENOEXEC, ENODEV, ENOMEM, ENOSPC, ENOTDIR,
+    ENOTSUP, EROFS, EUCLEAN,
+};
 
 /// 后端能力位（CSS-2，见 `docs/storage.md` 5.1）。
 ///

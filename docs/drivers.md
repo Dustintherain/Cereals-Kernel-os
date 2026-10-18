@@ -4,7 +4,7 @@
 - 最后更新：2026-10-14
 - 状态：✅ v0.8 已完成（**驱动注册框架 + PCI 枚举 + 块设备抽象 + virtio-blk（legacy）**，`make test-driver` 23 项 PASS；**磁盘文件系统 FAT12/16/32 已挂到 VFS**，`make test-fat` 21 项 PASS）；**v1.0 驱动兼容性：AHCI/SATA 驱动已落地**（`make test-ahci` 24 项 PASS，见 1.9；顺带修掉 PCI 枚举的真缺陷 B-18 —— 多功能设备的 function 1..7 从来没被枚举过）；**v0.9 简化网络栈已落地**（**virtio-net（legacy）+ Ethernet → ARP → IPv4 → UDP**，见 1.8）+
 **TCP/socket 补齐已落地**（内核 TCP 客户端最小集 + `socket/bind/connect/sendto/recvfrom` +
-`/bin/tcpecho`，`make test-network` 13 → **23 项** PASS，见 1.10）；v0.4（中断控制器 + PIT + PS/2 键盘 + 上下文切换原语 + H-04/H-05 Go 工具）已完成
+`/bin/tcpecho`，`make test-network` 13 → **24 项** PASS，见 1.10）；v0.4（中断控制器 + PIT + PS/2 键盘 + 上下文切换原语 + H-04/H-05 Go 工具）已完成
 - 依赖：interrupt（IRQ 分发）、memory（连续物理帧 → DMA / virtqueue）、arch::port（端口 I/O）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
@@ -211,7 +211,7 @@ net::report()             → 打印设备名与 MAC
 network::selftest(dev)    → ARP 解析网关 + DHCP DISCOVER → OFFER + TCP 回声往返（见 1.10）
 ```
 
-**验收（`make test-network`，13 → 23 项串口断言）** —— QEMU 加一块 legacy virtio-net-pci，
+**验收（`make test-network`，13 → 24 项串口断言）** —— QEMU 加一块 legacy virtio-net-pci，
 `-netdev user`（slirp）自带 DHCP 服务器与虚拟网关；TCP 步另需测试侧在宿主起回声服务
 （`--tcp-echo-port`，见 1.10 —— 这是 TCP 验收唯一需要宿主配合的一处）：
 
@@ -329,11 +329,11 @@ v0.9 的网络只到 UDP，`network/tcp.rs` 与 `network/socket.rs` 是占位（
 | `kernel/src/syscall/net.rs` | 五个 handler（`socket/bind/connect/sendto/recvfrom` = 号 41/49/42/44/45）+
   `read`/`write`/`close` 落到套接字 fd 的路由（`read` = 首段即返，`write` = 全发） |
 | `abi/src/sock.rs` | `AF_INET`/`SOCK_STREAM`/`IPPROTO_TCP` + `sockaddr_in` 布局（阶段三单一事实源） |
-| `userland/user/tcpecho` | `/bin/tcpecho`：`connect(10.0.2.2:18080)` 后两轮收发（`sendto`/`recvfrom` +
-  `write`/`read`，同一连接，逐字节比对） |
+| `userland/user/tcpecho` | `/bin/tcpecho`：`connect(10.0.2.2:18080)` 后三轮收发（`sendto`/`recvfrom` +
+  `write`/`read` + 3000 B 超 MSS 小缓冲读，同一连接，逐字节比对） |
 | `tests/test_boot.py` | 新增 `--tcp-echo-port`：宿主回声服务（发什么回什么；内核经 slirp 网关连它） |
 
-验收（`make test-network`，13 → **23 项**）—— 前 13 项（ARP/DHCP）不变，新增：
+验收（`make test-network`，13 → **24 项**）—— 前 13 项（ARP/DHCP）不变，新增：
 
 ```text
 net: tcp connect 10.0.2.2:18080 ESTABLISHED   ← SYN 的确认号对上 iss+1，第三次 ACK 已发
@@ -343,6 +343,7 @@ net: tcp close FIN-ACK PASS                  ← FIN 被确认 + 对端 FIN 已�
 net: tcp PASS
 tcpecho: round 1 sendto/recvfrom PASS        ← 用户态 44/45 号路径通
 tcpecho: round 2 write/read PASS             ← 用户态 1/0 号落到套接字 fd 的路由通
+tcpecho: round 3 large payload PASS len=3000 ← 超 MSS 分段 + 512 B 小缓冲读不丢字节
 tcpecho: PASS
 user: tcpecho PASS                           ← 内核自测跑 `/bin/tcpecho`，`exit(0)`
 ```
@@ -386,7 +387,7 @@ user: tcpecho PASS                           ← 内核自测跑 `/bin/tcpecho`�
 
 - [x] Shell 交互可用（`make test-shell`，v0.9 第二步）
 - [x] 网络最小闭环：ARP 解析网关 + DHCP 的 UDP 往返（`make test-network`）
-- [x] TCP 回声往返：内核自测 + 用户态 socket 两轮收发（`make test-network` 13 → 23 项）
+- [x] TCP 回声往返：内核自测 + 用户态 socket 三轮收发（`make test-network` 13 → 24 项）
 - [ ] ping 简例（ICMP 仍未做）；HTTP 简例可用 TCP 手写（未立项）
 
 ### 2.3 v1.0（驱动兼容性：从「虚拟化够用」走向「真机也能起来」）

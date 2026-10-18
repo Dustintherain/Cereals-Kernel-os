@@ -834,7 +834,14 @@ impl FileSystem for FatFs {
         if entry.is_dir {
             return Err(vfs::EISDIR);
         }
-        let mut out = alloc::vec![0u8; entry.size as usize];
+        // 目录项里的 size 是**磁盘上的字节**，不可信：伪造的 0xFFFF_FFFF 会让内核
+        // 先做一次 4 GiB 分配（分配失败 = abort），还没读到任何数据就死了。
+        // 两个边界：不超过卷容量；分配用 `try_reserve`，OOM 归一为 -ENOMEM。
+        let volume_bytes = self.geometry.total_sectors as u64 * SECTOR_SIZE as u64;
+        let size = (entry.size as u64).min(volume_bytes) as usize;
+        let mut out = Vec::new();
+        out.try_reserve_exact(size).map_err(|_| vfs::ENOMEM)?;
+        out.resize(size, 0);
         let read = self.read_file(&entry, 0, &mut out)?;
         out.truncate(read);
         Ok(out)

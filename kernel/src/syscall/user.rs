@@ -33,7 +33,7 @@
 //!   只需要一条内核能力（`getdents` / 文件 syscall / `write` / `getprocs`），
 //!   因此同时是「用户态能不能真的用上 VFS/进程表」的验收。
 //! - [`TCPECHO_PATH`]：**socket 验收程序** —— 有网卡时才运行（`socket`/`connect`/
-//!   `sendto`/`recvfrom` + `write`/`read` 两轮回声收发），无网卡时跳过。
+//!   `sendto`/`recvfrom` + `write`/`read` 两轮 + 超 MSS 小缓冲第三轮回声收发），无网卡时跳过。
 //!
 //! 这些常量是**内核与用户态之间的契约**：非空清单必须提供这些路径（否则 selftest
 //! 报 `ENOENT`）；空清单则走「纯内核诊断」分支，内核不依赖用户态存在。
@@ -85,7 +85,7 @@ pub const PS_PATH: &str = "/bin/ps";
 pub const USER_FILE: &str = "/tmp/hello.txt";
 /// v0.9 动态链接主程序路径（ET_DYN PIE，见 user/dynhello/）。
 pub const DYNHELLO_PATH: &str = "/bin/dynhello";
-/// socket/TCP 用户态验收程序路径（`user/tcpecho`：connect 回声服务，两轮收发）。
+/// socket/TCP 用户态验收程序路径（`user/tcpecho`：connect 回声服务，三轮收发）。
 ///
 /// 只在有网卡时运行（`make test-network` 的 QEMU 带 virtio-net-pci + 回声服务）；
 /// 无网卡时跳过（不是失败），因此纯内核/无网测试的串口只多一行 SKIP。
@@ -343,9 +343,15 @@ pub fn selftest() -> Result<(), &'static str> {
     // 有用户态：清单必须与内核期望的路径一致（缺一条就明确报错，见契约常量）。
     check_manifest_contract()?;
     crate::syscall::init();
-    // 0 号保留给 `kernel_main`（启动上下文），用户程序从 1 开始编号 ——
-    // `fork` 继续往下取号，因此 PID 不会与顶层程序撞车。
-    let _kernel_main = pid::alloc();
+    // 0 号是 `kernel_main`（启动上下文），顶层用户程序用固定 PID 1/3/4/5
+    //（`init` / `sh` / `dynhello` / `tcpecho`：测试与 `ps` 按这些号断言）。
+    // 这些号必须从 `pid::alloc()` 里**保留**掉 —— 否则 `fork` 会从当前计数
+    //（启动阶段调度器已消耗 0..3）继续发号，第三个子进程就可能拿到与 Shell
+    // 相同的 PID。两套号源在这里合并，`fork` 只会拿到 6 以上的号。
+    pid::reserve(0);
+    for top_level in 1..=5 {
+        pid::reserve(top_level);
+    }
     serial::println("user: selftest begin");
     let free_before = frame::stats().free_frames;
 
@@ -402,7 +408,7 @@ pub fn selftest() -> Result<(), &'static str> {
     serial::println("user: dynamic link PASS (PT_INTERP + libgreet.so + RELATIVE/JUMP_SLOT)");
 
     // 5.5) socket/TCP 用户态验收：`/bin/tcpecho` 走 `socket/connect/sendto/recvfrom`
-    //    与 `write/read` 两套形状与回声服务做两轮收发。无网卡时跳过（回声服务只在
+    //    与 `write/read` 两套形状、再加 3000 B 小缓冲一轮与回声服务收发。无网卡时跳过（回声服务只在
     //    `--nic` 启动里存在，见 `network::TCP_ECHO_PORT`），不把「没有网卡」当失败。
     if crate::driver::net::count() == 0 {
         serial::println("user: tcpecho SKIP (no network device)");

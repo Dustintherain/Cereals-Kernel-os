@@ -92,16 +92,31 @@ pub fn parse(buf: &[u8]) -> Option<ArpPacket> {
     })
 }
 
+/// 一条 ARP 缓存记录（带上写入时刻，用于过期）。
+#[derive(Clone, Copy)]
+struct Entry {
+    ip: Address,
+    mac: [u8; 6],
+    /// 写入时刻（PIT tick）。
+    stamp: u64,
+}
+
 /// 固定容量的 IP → MAC 缓存（线性探测，容量小到不值得上哈希表）。
+///
+/// 满了之后按**轮转**替换（不是 LRU：v0.9 只解析网关，没必要为替换策略记账）。
+/// 条目 [`TTL_TICKS`] 后过期：网关/宿主机换了 MAC（DHCP 重新租约、虚拟网络重建）
+/// 时不能一直用旧地址。
 pub struct Cache {
-    entries: [Option<(Address, [u8; 6])>; Cache::CAPACITY],
-    /// 下一个要覆盖的槽位（简单的轮转替换）。
+    entries: [Option<Entry>; Cache::CAPACITY],
+    /// 下一个要覆盖的槽位。
     next: usize,
 }
 
 impl Cache {
     /// 缓存容量（v0.9 只解析网关，4 条足够）。
     pub const CAPACITY: usize = 4;
+    /// 条目有效期（100Hz → 6000 tick = 60 秒）。
+    pub const TTL_TICKS: u64 = 6000;
 
     /// 空缓存（`const` 构造，可直接放静态量里）。
     pub const fn new() -> Self {
@@ -111,28 +126,26 @@ impl Cache {
         }
     }
 
-    /// 查表。
+    /// 查表（过期条目当作未命中）。
     pub fn lookup(&self, ip: Address) -> Option<[u8; 6]> {
+        let now = ticks();
         self.entries
             .iter()
             .flatten()
-            .find(|(cached, _)| *cached == ip)
-            .map(|(_, mac)| *mac)
+            .find(|e| e.ip == ip && now.wrapping_sub(e.stamp) <= Self::TTL_TICKS)
+            .map(|e| e.mac)
     }
 
-    /// 插入/更新一条。
+    /// 插入/更新一条（已存在则刷新 MAC 与时间戳）。
     pub fn insert(&mut self, ip: Address, mac: [u8; 6]) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .flatten()
-            .find(|(cached, _)| *cached == ip)
-        {
-            entry.1 = mac;
+        let now = ticks();
+        if let Some(entry) = self.entries.iter_mut().flatten().find(|e| e.ip == ip) {
+            entry.mac = mac;
+            entry.stamp = now;
             return;
         }
         let slot = self.next % Self::CAPACITY;
-        self.entries[slot] = Some((ip, mac));
+        self.entries[slot] = Some(Entry { ip, mac, stamp: now });
         self.next = (slot + 1) % Self::CAPACITY;
     }
 
@@ -159,7 +172,10 @@ pub fn resolve(
     target: Address,
     timeout_ticks: u64,
 ) -> Option<[u8; 6]> {
-    let mut frame = [0u8; ethernet::HEADER_LEN + PACKET_LEN];
+    // 以太网帧最小 60 字节（不含 FCS）：ARP 只有 14+28=42 字节，不补齐的话
+    // 真网卡/交换机会当短帧丢弃（slirp 恰好容忍，所以以前没暴露）。
+    const MIN_FRAME_LEN: usize = 60;
+    let mut frame = [0u8; MIN_FRAME_LEN];
     let mut arp_bytes = [0u8; PACKET_LEN];
     build(
         &mut arp_bytes,

@@ -14,8 +14,14 @@
 pub const EPERM: i64 = -1;
 /// `-ENOENT`：路径不存在。
 pub const ENOENT: i64 = -2;
+/// `-EINTR`：等待被中断（`nanosleep` 检测到计时器停摆时的兜底）。
+pub const EINTR: i64 = -4;
 /// `-EIO`：设备读写/扫描失败（存储类调用）。
 pub const EIO: i64 = -5;
+/// `-E2BIG`：`argv` 总量超过用户栈预留区（`execve`）。
+pub const E2BIG: i64 = -7;
+/// `-ENOEXEC`：可执行文件格式非法（ELF 装载器拒绝）。
+pub const ENOEXEC: i64 = -8;
 /// `-EBADF`：fd 无效 / 未打开 / 打开模式与操作不符。
 pub const EBADF: i64 = -9;
 /// `-ECHILD`：`wait4` 找不到该 PID 的直接子进程。
@@ -26,6 +32,12 @@ pub const EAGAIN: i64 = -11;
 pub const ENOMEM: i64 = -12;
 /// `-EACCES`：mode 不允许（POSIX）。
 pub const EACCES: i64 = -13;
+/// `-EEXIST`：目标已存在（`O_CREAT` 之外的创建路径）。
+pub const EEXIST: i64 = -17;
+/// `-ENODEV`：设备不存在 / 已消失（与「坏盘」可区分）。
+pub const ENODEV: i64 = -19;
+/// `-ENOTDIR`：路径中间分量不是目录。
+pub const ENOTDIR: i64 = -20;
 /// `-EFAULT`：用户传了不属于自己的地址区间。
 pub const EFAULT: i64 = -14;
 /// `-EISDIR`：目标是目录，但调用方要当文件用。
@@ -34,10 +46,16 @@ pub const EISDIR: i64 = -21;
 pub const EINVAL: i64 = -22;
 /// `-ENOSPC`：空间不足（fd 用尽 / 超过 RAMFS 上限）。
 pub const ENOSPC: i64 = -28;
+/// `-EROFS`：只读文件系统（写落到只读后端）。
+pub const EROFS: i64 = -30;
 /// `-ENOSYS`：号合法但内核未实现（或号越界时的兜底返回）。
 pub const ENOSYS: i64 = -38;
+/// `-ENOTSUP`：识别到文件系统/特性，但内核没有对应实现（与「路径不存在」区分）。
+pub const ENOTSUP: i64 = -95;
 /// `-EAFNOSUPPORT`：不支持的地址族/类型/协议（socket 只认 `AF_INET` + `SOCK_STREAM` + TCP）。
 pub const EAFNOSUPPORT: i64 = -97;
+/// `-EUCLEAN`：磁盘上的结构损坏（簇链断/越界、目录项非法）。
+pub const EUCLEAN: i64 = -117;
 /// `-ENOTCONN`：套接字未连接（`send`/`recv` 之前必须先 `connect`）。
 pub const ENOTCONN: i64 = -107;
 /// `-ETIMEDOUT`：TCP 握手/收发超时（重传耗尽，对端无应答）。

@@ -47,6 +47,22 @@ pub const TCP_ECHO_PAYLOAD: &[u8] = b"cerlesse-tcp";
 /// TCP 自测用的本机端口（临时端口段之外，测试断言不绑定它）。
 pub const TCP_LOCAL_PORT: u16 = 41000;
 
+/// 当前本机 IPv4 地址（DHCP 租约落地到这里）。
+///
+/// 为什么是全局量：`network::socket` 手里只有设备与序号表，没有 `Stack`；
+/// 而 TCP 的源地址必须与 DHCP 实际租到的地址一致，不能永远写死 [`GUEST_IP`]。
+static mut LOCAL_IP: ipv4::Address = GUEST_IP;
+
+/// 当前本机 IPv4 地址（DHCP 之前是 slirp 的默认租约）。
+pub fn local_ip() -> ipv4::Address {
+    unsafe { *(&raw const LOCAL_IP) }
+}
+
+/// 记录 DHCP 租约得到的地址。
+fn set_local_ip(ip: ipv4::Address) {
+    unsafe { *(&raw mut LOCAL_IP) = ip }
+}
+
 /// ARP 解析的等待上限（PIT tick；100Hz → 100 tick = 1 秒）。
 const ARP_TIMEOUT_TICKS: u64 = 100;
 /// DHCP 应答的等待上限（100Hz → 300 tick = 3 秒）。
@@ -104,8 +120,13 @@ impl<'a> Stack<'a> {
     }
 
     /// 发送一个 UDP 数据报（自己负责 Ethernet + IPv4 的封装）。
-    pub fn send_udp(
+    ///
+    /// 源地址显式给出：DHCP DISCOVER 必须用 `0.0.0.0`（此时还没有租约），
+    /// 其它报文用 `self.ip`。
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_udp_from(
         &mut self,
+        src_ip: ipv4::Address,
         dst_ip: ipv4::Address,
         dst_mac: [u8; 6],
         src_port: u16,
@@ -121,7 +142,7 @@ impl<'a> Stack<'a> {
         let ip_payload_len = udp::HEADER_LEN + payload.len();
         let ip = ipv4::build(
             eth,
-            self.ip,
+            src_ip,
             dst_ip,
             ipv4::PROTO_UDP,
             64, // TTL
@@ -129,7 +150,7 @@ impl<'a> Stack<'a> {
             ip_payload_len,
         )
         .ok_or("net: frame buffer too small for IPv4 header")?;
-        udp::build(ip, self.ip, dst_ip, src_port, dst_port, payload)
+        udp::build(ip, src_ip, dst_ip, src_port, dst_port, payload)
             .ok_or("net: frame buffer too small for UDP datagram")?;
 
         let total = ethernet::HEADER_LEN + ipv4::HEADER_LEN + ip_payload_len;
@@ -154,7 +175,12 @@ impl<'a> Stack<'a> {
     pub fn dhcp_discover(&mut self) -> Result<dhcp::Offer, &'static str> {
         let mut payload = [0u8; dhcp::MESSAGE_LEN];
         let len = dhcp::build_discover(&mut payload, self.mac);
-        self.send_udp(
+        if len == 0 {
+            return Err("net: DHCP DISCOVER buffer too small");
+        }
+        // RFC 2131：DISCOVER 的源地址是 0.0.0.0（此时还没有租约）。
+        self.send_udp_from(
+            ipv4::Address::UNSPECIFIED,
             ipv4::Address::BROADCAST,
             ethernet::BROADCAST_MAC,
             dhcp::CLIENT_PORT,
@@ -181,6 +207,13 @@ impl<'a> Stack<'a> {
             if header.protocol != ipv4::PROTO_UDP {
                 continue;
             }
+            // 只接受发给本机（或广播）的报文：不给“发给别的地址的帧”进解析器。
+            if header.dst != self.ip
+                && header.dst != ipv4::Address::BROADCAST
+                && header.dst != ipv4::Address::UNSPECIFIED
+            {
+                continue;
+            }
             let Some(datagram) = udp::parse(ip_payload, header.src, header.dst) else {
                 continue;
             };
@@ -188,6 +221,14 @@ impl<'a> Stack<'a> {
                 continue;
             }
             if let Some(offer) = dhcp::parse_offer(datagram.payload) {
+                // 租约落地：本机地址与网关都取 OFFER 里的值（而不是永远用 slirp 默认值）。
+                if offer.yiaddr != ipv4::Address::UNSPECIFIED {
+                    self.ip = offer.yiaddr;
+                    set_local_ip(offer.yiaddr);
+                }
+                if let Some(router) = offer.router {
+                    self.gateway = router;
+                }
                 return Ok(offer);
             }
         }

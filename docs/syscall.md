@@ -13,8 +13,8 @@
   `make test-user` 96 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 条正则 /
   `make test-programs` 33 项 + 7 条正则 / `make test-dyn` 10 项 / `make test-fs` 21 项 PASS；
   **socket/TCP（3.13）**：`socket`/`bind`/`connect`/`sendto`/`recvfrom`
-  （Linux 号 41/42/44/45/49）+ 内核 TCP 客户端最小集 + `/bin/tcpecho` 两轮回声收发，
-  `make test-network` 23 项 PASS（见 drivers.md 1.8）；
+  （Linux 号 41/42/44/45/49）+ 内核 TCP 客户端最小集 + `/bin/tcpecho` 三轮回声收发，
+  `make test-network` 24 项 PASS（见 drivers.md 1.8）；
   仍未做：环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`，见 3.9）、文件映射（`mmap` 加 offset）、
   TCP 服务端（`listen`/`accept`）、UDP 套接字、ICMP
 - **阶段三（2026-10-12）**：调用号 / `errno` / 标志位 / 记录布局的**权威定义已移入 `abi/` crate**
@@ -42,7 +42,7 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
    `PROT_NONE` 与 W^X 的「先 `mmap(RW)` 写、再 `mprotect(RX)` 执行」因此成立。
 8. **socket/TCP（已做，见 3.13）**：`socket`/`bind`/`connect`/`sendto`/`recvfrom`
    （Linux 号 41/42/44/45/49）+ 内核 TCP 客户端最小集（三次握手/按序收发/FIN 关闭）+
-   `/bin/tcpecho`（`sendto`/`recvfrom` 与 `write`/`read` 两轮回声收发）。
+   `/bin/tcpecho`（`sendto`/`recvfrom` 与 `write`/`read` 两轮 + 超 MSS 小缓冲第三轮）。
 9. **仍未做**：环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`）、文件映射（`mmap` 加 offset）、
    TCP 服务端（`listen`/`accept`）、UDP 套接字、ICMP。
 
@@ -131,7 +131,7 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 | syscall | 号 | 状态 | 行为 |
 | ---- | ---- | ---- | ---- |
 | `read` | 0 | ✅ v0.7 / v0.9 / TCP 补齐 | fd 0 → **键盘行缓冲整行交付**（v0.9：行尾统一 `\n`；3 秒无整行 → `-EAGAIN`，见 3.6）；fd ≥ 3 → 从 VFS 读入用户缓冲（要求**可写**，否则 `-EFAULT`）；偏移量随之推进，EOF 返回 0；**套接字 fd（≥ 16）→ `recv`（首段即返），见 3.13** |
-| `write` | 1 | ✅ v0.6/v0.7 / TCP 补齐 | `fd=1/2` 写串口；`fd ≥ 3` 写文件（VFS，偏移量随之推进）；缓冲要求可读；**套接字 fd（≥ 16）→ `send`（全发），见 3.13** |
+| `write` | 1 | ✅ v0.6/v0.7 / TCP 补齐 | `fd=1/2` 写串口；`fd ≥ 3` 写文件（VFS，偏移量随之推进）；缓冲要求可读；**套接字 fd（≥ 16）→ `send`（返回已确认字节数，可能部分发送），见 3.13** |
 | `open` | 2 | ✅ v0.7 | `open(path_ptr, path_len, flags)`：路径用**指针 + 长度**（内核已校验区间，不在不可信内存上找 NUL）；`flags` 只接受 `O_RDONLY`/`O_WRONLY`/`O_RDWR`/`O_CREAT`，返回**最小空闲 fd**（≥3） |
 | `close` | 3 | ✅ v0.7 / TCP 补齐 | 释放动态 fd（0/1/2 是保留位，关闭它们返回 `-EBADF`）；**套接字 fd 先 FIN 关闭再释放槽位（握手失败也释放），见 3.13** |
 | `sleep`（nanosleep） | 35 | ✅ v0.6 | 以 PIT tick（10ms）为单位等待；期间 `sti; hlt` 让 PIT 继续推进 |
@@ -734,7 +734,7 @@ v0.9 的网络只到 UDP（`network/{tcp,socket}.rs` 是占位，见 drivers.md 
 | `socket(domain, ty, protocol)` | **41** | 只认 `AF_INET`(2) + `SOCK_STREAM`(1) + `IPPROTO_TCP`(6)/0 | 其余组合 `-EAFNOSUPPORT`；表满（8 个）`-ENOSPC` |
 | `bind(fd, addr_ptr, 16)` | **49** | `sockaddr_in`，地址只接受全 0（bind-any），端口非 0 | `addr_len != 16` / 端口 0 / 端口被占 / 重复 bind → `-EINVAL` |
 | `connect(fd, addr_ptr, 16)` | **42** | 三次握手，阻塞到建立或失败；未 `bind` 时从临时段自动分配端口 | 对端 RST → `-ECONNREFUSED`；重传耗尽 → `-ETIMEDOUT` |
-| `sendto(fd, buf, len, 0, 0)` | **44** | 已连接套接字上全发（按 MSS 切块、每块等累积 ACK） | 未连接 `-ENOTCONN`；带地址 `-EINVAL`；对端已 FIN 还要发 `-EIO` |
+| `sendto(fd, buf, len, 0, 0)` | **44** | 已连接套接字上发送（按 MSS 切块、每块等累积 ACK；返回已确认字节数，可能少于 `len`） | 未连接 `-ENOTCONN`；带地址 `-EINVAL`；超时 `-ETIMEDOUT`；对端 RST `-ECONNREFUSED`（对端半关闭仍可单向发送） |
 | `recvfrom(fd, buf, len, 0, 0)` | **45** | 首段即返（`0` = 对端有序关闭）；地址回填未实现，传 0 | 未连接 `-ENOTCONN`；带地址 `-EINVAL`；超时 `-ETIMEDOUT` |
 
 - 地址布局的权威定义在 `abi::sock`（16 字节：family LE + port BE + addr + 补 0），
@@ -742,19 +742,21 @@ v0.9 的网络只到 UDP（`network/{tcp,socket}.rs` 是占位，见 drivers.md 
   `-EAFNOSUPPORT`(97)/`-ENOTCONN`(107)/`-ETIMEDOUT`(110)/`-ECONNREFUSED`(111)；
 - fd 号段：套接字 16..=23（`SOCK_FD_BASE`，`network::socket` 表），文件 0..=15 ——
   `read`/`write`/`close` 按号段分发到同一套后端（`read` = `recv` 首段即返，
-  `write` = `send` 全发，`close` 先 FIN 关闭再释放槽位）；
+  `write` = `send`（返回已确认字节数，可能部分发送），`close` 先 FIN 关闭再释放槽位）；
 - **用户态**：`libc` 新增 `socket`/`bind`/`connect`/`sendto`/`recvfrom` + `sockaddr_in` 构造器
   （`lib.rs` re-export），新增 `/bin/tcpecho`（`user/tcpecho`）：`connect(10.0.2.2:18080)` 后做
-  **两轮**收发 —— 第一轮 `sendto`/`recvfrom`，第二轮 `write`/`read`（同一连接，
-  覆盖 fd 路由），逐字节比对，成功 `tcpecho: PASS` + `exit(0)`；
+  **三轮**收发 —— 第一轮 `sendto`/`recvfrom`，第二轮 `write`/`read`（同一连接，
+  覆盖 fd 路由），第三轮 3000 字节（> MSS，切三段）用 512 字节小缓冲读
+  （验证未交付字节不被 ACK 吞掉）；逐字节比对，成功 `tcpecho: PASS` + `exit(0)`；
 - 内核自测（`syscall/user.rs`）：有网卡时跑 `/bin/tcpecho` 并要求 `exit(0)`
   （`user: tcpecho PASS`），无网卡时 `user: tcpecho SKIP`（不是失败）；
   套接字表随 `fs::file::reset` 一起在每次进入用户态前清空（全局表模型，见 `network/socket.rs`）；
-- 验收（`make test-network` 13 → **23 项**，编排 `network` 场景同步）：
+- 验收（`make test-network` 13 → **24 项**，编排 `network` 场景同步）：
   `net: tcp connect 10.0.2.2:18080 ESTABLISHED` → `send len=12 acked` →
   `recv len=12 match=PASS` → `close FIN-ACK PASS` → `tcp PASS`（内核自测），
-  再 `tcpecho: round 1 sendto/recvfrom PASS` / `round 2 write/read PASS` / `tcpecho: PASS` /
-  `user: tcpecho PASS`（用户态两条 syscall 路径）；
+  再 `tcpecho: round 1 sendto/recvfrom PASS` / `round 2 write/read PASS` /
+  `round 3 large payload PASS len=3000` / `tcpecho: PASS` / `user: tcpecho PASS`
+  （用户态 syscall 路径 + 超 MSS 分段与小缓冲读）；
 - 明确不做（见 drivers.md 1.8）：服务端（`listen`/`accept`）、UDP 套接字、ICMP、
   窗口通告与流控（恒 65535）、SACK/时间戳/窗口扩大、乱序重组、RTO 估算。
 

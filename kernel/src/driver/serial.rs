@@ -48,6 +48,30 @@ pub fn init() {
     }
 }
 
+/// 当前是否有一行日志还没输出完（`LINE_OPEN`）。
+///
+/// 用途：IRQ0 的心跳只在一行的边界上输出。一条日志由多次 `print` 拼成
+///（`print("user: program=")` + `print(path)` + …），如果心跳在中间插入，
+/// 串口上就会出现 `user: prIRQ0_heartbeat…ogram=/init` —— 验收脚本断言的子串
+/// 被劈成两半（这是实测到过的 flake）。
+static mut LINE_OPEN: bool = false;
+
+/// 是否处于一行日志的中间（心跳/异步输出应让路）。
+pub fn line_open() -> bool {
+    unsafe { *core::ptr::addr_of!(LINE_OPEN) }
+}
+
+/// 根据刚写出的字节更新行状态（`\n` 结束一行，`\r` 不改变状态）。
+fn mark_line(c: u8) {
+    unsafe {
+        if c == b'\n' {
+            *core::ptr::addr_of_mut!(LINE_OPEN) = false;
+        } else if c != b'\r' {
+            *core::ptr::addr_of_mut!(LINE_OPEN) = true;
+        }
+    }
+}
+
 /// 输出单个字节（供需要按字节回显的驱动使用，如键盘回显）。
 pub fn putc(c: u8) {
     unsafe {
@@ -55,6 +79,7 @@ pub fn putc(c: u8) {
         while inb(COM1 + 5) & 0x20 == 0 {}
         outb(COM1, c);
     }
+    mark_line(c);
 }
 
 /// 批量输出 `buf` 的前 `count` 字节，返回实际写出的字节数。

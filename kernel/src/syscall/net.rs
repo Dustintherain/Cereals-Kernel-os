@@ -16,7 +16,8 @@
 //!
 //! `read`/`write`/`close` 对套接字 fd 同样有效（见 [`socket_read`] /
 //! [`socket_write`] / [`socket_close`]，由 `syscall::file` 按号段分发）：
-//! `read` = `recv`（首段即返），`write` = `send`（全发）。
+//! `read` = `recv`（首段即返），`write` = `send`（按 MSS 切块，可能只发出去一部分，
+//! 返回值就是**已确认的字节数**；调用方据此重发剩余部分，不要整段重发）。
 
 use abi::errno::{EAFNOSUPPORT, EINVAL};
 use abi::sock::{ADDR_OFFSET, AF_INET, FAMILY_OFFSET, PORT_OFFSET, SOCKADDR_IN_LEN};
@@ -152,7 +153,10 @@ pub unsafe fn sys_connect(args: &[u64; 5], space: *const UserSpace) -> i64 {
     }
 }
 
-/// 系统调用 `sendto(fd, buf, len, 0, 0)`：已连接套接字上全发。
+/// 系统调用 `sendto(fd, buf, len, 0, 0)`：已连接套接字上发送。
+///
+/// 返回已确认的字节数：中途超时/RST 时可能少于 `len`（前几段已送达），
+/// 只有一段都没发出去时才返回负 errno。
 ///
 /// # Safety
 /// `space` 必须是当前生效的用户地址空间；`buf` 必须可读。

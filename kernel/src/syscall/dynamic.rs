@@ -48,7 +48,7 @@ use alloc::vec::Vec;
 use crate::driver::serial;
 use crate::fs::vfs;
 use crate::fs::vfs::{ENOENT, ENOEXEC};
-use crate::memory::page::{align_down, align_up, PAGE_SIZE};
+use crate::memory::page::{align_down, PAGE_SIZE};
 use crate::syscall::address_space::{
     LoadStats, UserSpace, USER_DYN_BASE, USER_DYN_MAX, USER_DYN_PAGES, USER_IMAGE_MAX,
     USER_VIRT_BASE,
@@ -88,6 +88,10 @@ const MAX_OBJECTS: usize = 8;
 const MAX_SYM_NAME: usize = 128;
 /// 默认的结构体大小（`DT_SYMENT` / `DT_RELAENT` 缺失时按 24 兜底 —— ELF64 固定值）。
 const ELF64_STRUCT_SIZE: u64 = 24;
+/// `.dynsym` 项数上限：项数来自文件，不设上限就是给内核一个无界循环。
+const MAX_DYN_SYMS: usize = 4096;
+/// 一次装载应用的重定位条数上限（挡住伪造的 `DT_RELASZ`）。
+const MAX_RELOCS: usize = 4096;
 
 /// 一个 `PT_LOAD` 段。
 #[derive(Clone, Copy)]
@@ -167,7 +171,13 @@ fn parse_header(elf: &[u8]) -> Result<Header, i64> {
     if phentsize != PHDR_SIZE {
         return Err(reject("unexpected program header size"));
     }
-    if phnum == 0 || phoff + phnum * phentsize > elf.len() {
+    // `phoff + phnum*phentsize` 必须用 checked：输入是文件字节，溢出会在 debug
+    // 构建里直接 panic（这条路径的契约是「畸形 ELF 只返回 -ENOEXEC」）。
+    let table_len = phnum
+        .checked_mul(phentsize)
+        .and_then(|n| phoff.checked_add(n))
+        .ok_or_else(|| reject("program header table overflow"))?;
+    if phnum == 0 || table_len > elf.len() {
         return Err(reject("program headers outside file"));
     }
     Ok(Header {
@@ -198,9 +208,17 @@ pub fn load(space: &mut UserSpace, elf: &[u8]) -> Result<LoadStats, i64> {
                 if filesz > memsz {
                     return Err(reject("PT_LOAD p_filesz > p_memsz"));
                 }
-                if offset + filesz > elf.len() as u64 {
+                let file_end = offset
+                    .checked_add(filesz)
+                    .ok_or_else(|| reject("PT_LOAD offset overflow"))?;
+                if file_end > elf.len() as u64 {
                     return Err(reject("PT_LOAD extends past end of file"));
                 }
+                // 每个段自己的窗口上限在 `map_object` 里按 Image/Dyn 分别检查；
+                // 这里只挡住 `vaddr + memsz` 的算术溢出（下一步就会用它算页边界）。
+                vaddr
+                    .checked_add(memsz)
+                    .ok_or_else(|| reject("PT_LOAD address overflow"))?;
                 segments.push(Segment {
                     vaddr,
                     offset,
@@ -210,16 +228,27 @@ pub fn load(space: &mut UserSpace, elf: &[u8]) -> Result<LoadStats, i64> {
                 });
             }
             PT_INTERP => {
-                let offset = u64_at(elf, ph + 8).unwrap_or(0) as usize;
-                let filesz = u64_at(elf, ph + 32).unwrap_or(0) as usize;
-                let bytes = elf
-                    .get(offset..offset + filesz)
-                    .ok_or_else(|| reject("PT_INTERP outside file"))?;
+                let offset = u64_at(elf, ph + 8).unwrap_or(0);
+                let filesz = u64_at(elf, ph + 32).unwrap_or(0);
+                let end = offset
+                    .checked_add(filesz)
+                    .ok_or_else(|| reject("PT_INTERP offset overflow"))?;
+                if end > elf.len() as u64 {
+                    return Err(reject("PT_INTERP outside file"));
+                }
+                let bytes = &elf[offset as usize..end as usize];
                 let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                if nul == 0 || nul > abi::limits::PATH_MAX as usize {
+                    return Err(reject("PT_INTERP path length out of range"));
+                }
                 interp = Some(bytes[..nul].to_vec());
             }
             PT_DYNAMIC => {
-                dynamic_off = Some(u64_at(elf, ph + 8).unwrap_or(0) as usize);
+                let offset = u64_at(elf, ph + 8).unwrap_or(0);
+                if offset >= elf.len() as u64 {
+                    return Err(reject("PT_DYNAMIC outside file"));
+                }
+                dynamic_off = Some(offset as usize);
             }
             _ => {}
         }
@@ -270,7 +299,9 @@ pub fn load(space: &mut UserSpace, elf: &[u8]) -> Result<LoadStats, i64> {
     // 4. 重定位：对每个对象处理 .rela.dyn（DT_RELA）与 .rela.plt（DT_JMPREL）
     let relocs = relocate_all(space, &objects)?;
 
-    let entry = main_base + header.entry;
+    let entry = main_base
+        .checked_add(header.entry)
+        .ok_or_else(|| reject("entry point overflow"))?;
     let pages = space.image_pages() + space.dyn_page_count();
     serial::print("dyn: link PASS objects=");
     serial::print_dec(objects.len() as u64);
@@ -311,30 +342,42 @@ fn load_shared(
             return Err(ENOENT);
         }
     };
-    if elf.len() < EHDR_SIZE || &elf[..4] != b"\x7fELF" {
-        return Err(reject("shared object is not an ELF"));
-    }
-    if u16_at(&elf, 16) != Some(3) {
-        return Err(reject("shared object is not ET_DYN"));
-    }
+    // 与主程序共用同一套头部校验（没有“另一个更宽松的解析器”）。
+    let header = parse_header(&elf)?;
 
     // 解析程序头（只要 PT_LOAD 与 PT_DYNAMIC）
-    let phoff = u64_at(&elf, 32).unwrap_or(0) as usize;
-    let phentsize = u16_at(&elf, 54).unwrap_or(0) as usize;
-    let phnum = u16_at(&elf, 56).unwrap_or(0) as usize;
     let mut segments: Vec<Segment> = Vec::new();
     let mut dynamic_off: Option<usize> = None;
-    for i in 0..phnum {
-        let ph = phoff + i * phentsize;
-        match u32_at(&elf, ph).unwrap_or(0) {
-            PT_LOAD => segments.push(Segment {
-                vaddr: u64_at(&elf, ph + 16).unwrap_or(0),
-                offset: u64_at(&elf, ph + 8).unwrap_or(0),
-                filesz: u64_at(&elf, ph + 32).unwrap_or(0),
-                memsz: u64_at(&elf, ph + 40).unwrap_or(0),
-                flags: u32_at(&elf, ph + 4).unwrap_or(0),
-            }),
-            PT_DYNAMIC => dynamic_off = Some(u64_at(&elf, ph + 8).unwrap_or(0) as usize),
+    for i in 0..header.phnum {
+        let ph = header.phoff + i * header.phentsize;
+        match u32_at(&elf, ph).ok_or_else(|| reject("bad program header"))? {
+            PT_LOAD => {
+                let vaddr = u64_at(&elf, ph + 16).ok_or_else(|| reject("bad PT_LOAD vaddr"))?;
+                let offset = u64_at(&elf, ph + 8).ok_or_else(|| reject("bad PT_LOAD offset"))?;
+                let filesz = u64_at(&elf, ph + 32).ok_or_else(|| reject("bad PT_LOAD filesz"))?;
+                let memsz = u64_at(&elf, ph + 40).ok_or_else(|| reject("bad PT_LOAD memsz"))?;
+                let flags = u32_at(&elf, ph + 4).ok_or_else(|| reject("bad PT_LOAD flags"))?;
+                if filesz > memsz {
+                    return Err(reject("PT_LOAD p_filesz > p_memsz"));
+                }
+                let file_end = offset
+                    .checked_add(filesz)
+                    .ok_or_else(|| reject("PT_LOAD offset overflow"))?;
+                if file_end > elf.len() as u64 {
+                    return Err(reject("PT_LOAD extends past end of file"));
+                }
+                vaddr
+                    .checked_add(memsz)
+                    .ok_or_else(|| reject("PT_LOAD address overflow"))?;
+                segments.push(Segment { vaddr, offset, filesz, memsz, flags });
+            }
+            PT_DYNAMIC => {
+                let off = u64_at(&elf, ph + 8).ok_or_else(|| reject("bad PT_DYNAMIC offset"))?;
+                if off >= elf.len() as u64 {
+                    return Err(reject("PT_DYNAMIC outside file"));
+                }
+                dynamic_off = Some(off as usize);
+            }
             _ => {}
         }
     }
@@ -343,10 +386,13 @@ fn load_shared(
     }
 
     let (base, pages, w, b, s) = map_object(space, &elf, &segments, Window::Dyn { cursor: *cursor })?;
-    if *cursor + pages > USER_DYN_PAGES {
+    let next_cursor = cursor
+        .checked_add(pages)
+        .ok_or_else(|| reject("shared library window overflow"))?;
+    if next_cursor > USER_DYN_PAGES {
         return Err(reject("shared library window exhausted"));
     }
-    *bytes += b;
+    *bytes = bytes.checked_add(b).ok_or_else(|| reject("image size overflow"))?;
     *seg_count += s;
     *writable_pages += w;
 
@@ -394,9 +440,18 @@ fn map_object(
     let mut writable = 0usize;
     let mut bytes = 0u64;
     for seg in segments {
-        bytes += seg.memsz;
+        bytes = bytes
+            .checked_add(seg.memsz)
+            .ok_or_else(|| reject("segment size overflow"))?;
         let start = align_down(seg.vaddr, PAGE_SIZE);
-        let end = align_up(seg.vaddr + seg.memsz, PAGE_SIZE);
+        let seg_end = seg
+            .vaddr
+            .checked_add(seg.memsz)
+            .ok_or_else(|| reject("segment address overflow"))?;
+        let end = seg_end
+            .checked_add(PAGE_SIZE - 1)
+            .map(|v| v & !(PAGE_SIZE - 1))
+            .ok_or_else(|| reject("segment page boundary overflow"))?;
         // `end` 是对象内的相对虚拟地址（链接基址 0），窗口上限也是相对量
         if end > image_limit {
             return Err(reject("segment outside the load window"));
@@ -415,10 +470,18 @@ fn map_object(
             }
             // 该段落在本页内的文件字节区间
             let copy_start = seg.vaddr.max(page);
-            let copy_end = (seg.vaddr + seg.filesz).min(page + PAGE_SIZE);
+            let seg_file_end = seg
+                .vaddr
+                .checked_add(seg.filesz)
+                .ok_or_else(|| reject("segment file size overflow"))?;
+            let copy_end = seg_file_end.min(page + PAGE_SIZE);
             if copy_start < copy_end {
                 let in_page = (copy_start - page) as usize;
-                let file_at = (seg.offset + (copy_start - seg.vaddr)) as usize;
+                let file_at = seg
+                    .offset
+                    .checked_add(copy_start - seg.vaddr)
+                    .ok_or_else(|| reject("segment file offset overflow"))?
+                    as usize;
                 let len = (copy_end - copy_start) as usize;
                 // SAFETY: 物理帧由本空间拥有；内核 CR3 下物理地址恒等可写
                 unsafe {
@@ -443,8 +506,11 @@ fn map_object(
 fn parse_dynamic(elf: &[u8], off: usize) -> Result<(DynamicInfo, Vec<u32>), i64> {
     let mut info = DynamicInfo::default();
     let mut needed = Vec::new();
+    if off >= elf.len() {
+        return Err(reject("PT_DYNAMIC outside file"));
+    }
     let mut at = off;
-    while at + 16 <= elf.len() {
+    while at.checked_add(16).map_or(false, |end| end <= elf.len()) {
         let tag = u64_at(elf, at).unwrap_or(0);
         let val = u64_at(elf, at + 8).unwrap_or(0);
         if tag == DT_NULL {
@@ -476,16 +542,19 @@ fn parse_dynamic(elf: &[u8], off: usize) -> Result<(DynamicInfo, Vec<u32>), i64>
 /// `.dynsym` 表项数：优先 `DT_HASH.nchain`，否则由 `(strtab - symtab) / syment` 反推。
 fn nsym_of(space: &UserSpace, base: u64, info: &DynamicInfo) -> usize {
     if info.hash != 0 {
-        if let Some(n) = read_user_u32(space, base + info.hash + 4) {
+        if let Some(n) = read_user_u32(space, base.wrapping_add(info.hash).wrapping_add(4)) {
             return n as usize;
         }
     }
     let syment = if info.syment == 0 { ELF64_STRUCT_SIZE } else { info.syment };
-    if info.strtab > info.symtab && syment != 0 {
+    let n = if info.strtab > info.symtab && syment != 0 {
         ((info.strtab - info.symtab) / syment) as usize
     } else {
         0
-    }
+    };
+    // `.dynsym` 的项数来自文件（`DT_HASH.nchain` 也是）：不设上限的话，一个伪造的
+    // 巨大 nchain 会让 `resolve()` 对着同一个页做上亿次读取（内核内 DoS）。
+    n.min(MAX_DYN_SYMS)
 }
 
 /// 对所有对象应用重定位，返回处理的条数。
@@ -519,17 +588,29 @@ fn relocate_table(
     } else {
         obj.dyn_.relaent
     };
+    // 一条 RELA 至少 24 字节；`relaent=0` 已被默认值取代，但 `1`、`7` 这类值
+    // 仍会让 `off + relaent <= size` 成立上百次并把表读成碎片 —— 直接拒绝。
+    if relaent < ELF64_STRUCT_SIZE {
+        return Err(reject("DT_RELAENT is smaller than one entry"));
+    }
     let mut count = 0usize;
     let mut off = 0u64;
-    while off + relaent <= size {
-        let rela = obj.base + table + off;
+    while off.checked_add(relaent).map_or(false, |end| end <= size) {
+        let rela = obj
+            .base
+            .checked_add(table)
+            .and_then(|v| v.checked_add(off))
+            .ok_or_else(|| reject("RELA address overflow"))?;
         let r_offset = read_user_u64(space, rela).ok_or_else(|| reject("bad RELA offset"))?;
         let r_info = read_user_u64(space, rela + 8).ok_or_else(|| reject("bad RELA info"))?;
         let addend = read_user_u64(space, rela + 16).ok_or_else(|| reject("bad RELA addend"))? as i64;
         let rtype = (r_info & 0xffff_ffff) as u32;
         let sym_index = (r_info >> 32) as usize;
-        let target = obj.base + r_offset;
+        let target = obj.base.wrapping_add(r_offset);
         off += relaent;
+        if count >= MAX_RELOCS {
+            return Err(reject("too many relocations"));
+        }
 
         let value = match rtype {
             R_X86_64_RELATIVE => {
@@ -576,9 +657,18 @@ fn sym_name(space: &UserSpace, obj: &Object, index: usize) -> Result<String, i64
     if index == 0 || index >= obj.nsym || obj.dyn_.symtab == 0 {
         return Ok(String::new());
     }
-    let entry = obj.base + obj.dyn_.symtab + index as u64 * ELF64_STRUCT_SIZE;
+    // 全部用 wrapping：`st_name`/`DT_SYMTAB` 是文件里的 u64，加法溢出不应当 panic；
+    // 结果超出窗口时 `phys_of` 会返回 `None`，读取自然失败。
+    let entry = obj
+        .base
+        .wrapping_add(obj.dyn_.symtab)
+        .wrapping_add((index as u64).wrapping_mul(ELF64_STRUCT_SIZE));
     let name_off = read_user_u32(space, entry).ok_or_else(|| reject("bad dynsym entry"))?;
-    read_user_str(space, obj.base + obj.dyn_.strtab + name_off as u64, MAX_SYM_NAME)
+    read_user_str(
+        space,
+        obj.base.wrapping_add(obj.dyn_.strtab).wrapping_add(name_off as u64),
+        MAX_SYM_NAME,
+    )
 }
 
 /// 在所有对象里按名字找**已定义**的符号，返回 `(绝对地址, 定义所在对象下标)`。
@@ -591,7 +681,10 @@ fn resolve(space: &UserSpace, objects: &[Object], name: &str) -> Option<(u64, us
             continue;
         }
         for i in 1..obj.nsym {
-            let entry = obj.base + obj.dyn_.symtab + i as u64 * ELF64_STRUCT_SIZE;
+            let entry = obj
+                .base
+                .wrapping_add(obj.dyn_.symtab)
+                .wrapping_add((i as u64).wrapping_mul(ELF64_STRUCT_SIZE));
             let (Some(st_name), Some(st_shndx), Some(st_value)) = (
                 read_user_u32(space, entry),
                 read_user_u16(space, entry + 6),
@@ -602,10 +695,14 @@ fn resolve(space: &UserSpace, objects: &[Object], name: &str) -> Option<(u64, us
             if st_name == 0 || st_shndx == 0 {
                 continue; // 无名或未定义（SHN_UNDEF）——只认定义
             }
-            let candidate = read_user_str(space, obj.base + obj.dyn_.strtab + st_name as u64, MAX_SYM_NAME)
-                .unwrap_or_default();
+            let candidate = read_user_str(
+                space,
+                obj.base.wrapping_add(obj.dyn_.strtab).wrapping_add(st_name as u64),
+                MAX_SYM_NAME,
+            )
+            .unwrap_or_default();
             if candidate == name {
-                return Some((obj.base + st_value, oi));
+                return Some((obj.base.wrapping_add(st_value), oi));
             }
         }
     }
@@ -614,7 +711,7 @@ fn resolve(space: &UserSpace, objects: &[Object], name: &str) -> Option<(u64, us
 
 /// 读 `.dynstr` 里偏移 `off` 处的 NUL 结尾字符串（`DT_NEEDED` 的名字）。
 fn read_dynstr(space: &UserSpace, base: u64, info: &DynamicInfo, off: u32) -> Result<String, i64> {
-    read_user_str(space, base + info.strtab + off as u64, MAX_SYM_NAME)
+    read_user_str(space, base.wrapping_add(info.strtab).wrapping_add(off as u64), MAX_SYM_NAME)
 }
 
 /// 段权限位 → 页表项标志（与 `elf.rs::page_flags` 同一 W^X 规则）。
@@ -666,7 +763,7 @@ fn reject(reason: &str) -> i64 {
 fn read_user_u16(space: &UserSpace, virt: u64) -> Option<u16> {
     let mut raw = [0u8; 2];
     for (i, slot) in raw.iter_mut().enumerate() {
-        *slot = read_user_u8(space, virt + i as u64)?;
+        *slot = read_user_u8(space, virt.checked_add(i as u64)?)?;
     }
     Some(u16::from_le_bytes(raw))
 }
@@ -674,7 +771,7 @@ fn read_user_u16(space: &UserSpace, virt: u64) -> Option<u16> {
 fn read_user_u32(space: &UserSpace, virt: u64) -> Option<u32> {
     let mut raw = [0u8; 4];
     for (i, slot) in raw.iter_mut().enumerate() {
-        *slot = read_user_u8(space, virt + i as u64)?;
+        *slot = read_user_u8(space, virt.checked_add(i as u64)?)?;
     }
     Some(u32::from_le_bytes(raw))
 }
@@ -682,7 +779,7 @@ fn read_user_u32(space: &UserSpace, virt: u64) -> Option<u32> {
 fn read_user_u64(space: &UserSpace, virt: u64) -> Option<u64> {
     let mut raw = [0u8; 8];
     for (i, slot) in raw.iter_mut().enumerate() {
-        *slot = read_user_u8(space, virt + i as u64)?;
+        *slot = read_user_u8(space, virt.checked_add(i as u64)?)?;
     }
     Some(u64::from_le_bytes(raw))
 }
@@ -697,7 +794,7 @@ fn read_user_u8(space: &UserSpace, virt: u64) -> Option<u8> {
 fn read_user_str(space: &UserSpace, virt: u64, max: usize) -> Result<String, i64> {
     let mut out = String::new();
     for i in 0..max {
-        let Some(byte) = read_user_u8(space, virt + i as u64) else {
+        let Some(byte) = read_user_u8(space, virt.checked_add(i as u64).unwrap_or(u64::MAX)) else {
             break;
         };
         if byte == 0 {

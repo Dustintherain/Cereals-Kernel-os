@@ -50,7 +50,7 @@
 | 39 | `getpid` | ✅ | 当前进程 PID |
 | 41 | `socket` | ✅ | 只认 `AF_INET` + `SOCK_STREAM` + `IPPROTO_TCP`，返回套接字 fd（16..=23） |
 | 42 | `connect` | ✅ | TCP 三次握手（阻塞到建立或失败）；RST → `-ECONNREFUSED`，超时 → `-ETIMEDOUT` |
-| 44 | `sendto` | ✅ | 已连接套接字上全发；地址参数必须为 0（只做已连接字节流） |
+| 44 | `sendto` | ✅ | 已连接套接字上发送，返回**已确认字节数**（可能少于 `len`）；地址参数必须为 0（只做已连接字节流） |
 | 45 | `recvfrom` | ✅ | 首段即返（`0` = 对端有序关闭）；地址回填未实现，传 0 |
 | 49 | `bind` | ✅ | 固定本地端口（地址只收全 0；未绑定时 `connect` 自动分配临时端口） |
 | 57 | `fork` | ✅ | 复制当前进程 |
@@ -283,13 +283,13 @@ isize ckm_component_state(u8 *buf, usize buf_len, u64 *out_count, 0, 0)
 只做「已连接 TCP 字节流」这一个子集（客户端方向；`listen`/`accept` 等服务端号仍为 ENOSYS 桩，
 连名字都未发布）。后端是内核 `network::socket` 的 8 槽套接字表，fd 落独立号段 **16..=23**
 （不与文件 fd 重叠）；`read`/`write`/`close` 对套接字 fd 同样有效（`read` = `recv` 首段即返，
-`write` = `send` 全发，`close` 先发 FIN 再释放槽位）。
+`write` = `send`（返回已确认字节数，可能部分发送），`close` 先发 FIN 再释放槽位）。
 
 ```
 isize socket(u16 domain, i32 type, i32 protocol)   // 只认 AF_INET(2) + SOCK_STREAM(1) + IPPROTO_TCP(6)/0
 isize connect(i32 fd, u8 addr[16])                // 三次握手；未 bind 时从临时段自动分配本地端口
 isize bind(i32 fd, u8 addr[16])                   // 只固定本地端口，地址须是全 0（bind-any）
-isize sendto(i32 fd, u8 *buf, usize len)           // 已连接套接字上全发（按 MSS 切块、每块等累积 ACK）
+isize sendto(i32 fd, u8 *buf, usize len)           // 已连接套接字上发送（按 MSS 切块、每块等累积 ACK；返回已确认字节数）
 isize recvfrom(i32 fd, u8 *buf, usize len)         // 首段即返；0 = 对端有序关闭
 ```
 
@@ -304,10 +304,11 @@ isize recvfrom(i32 fd, u8 *buf, usize len)         // 首段即返；0 = 对端�
 | 8 | 8 | 补 0 | — |
 
 - `sendto`/`recvfrom` 带地址（指针非 0）一律 `-EINVAL`；未 `connect` 就收发 → `-ENOTCONN`；
-  对端已 FIN 还要发 → `-EIO`；用户指针先校验（`sockaddr` 要求可读、`recv` 缓冲要求可写），否则 `-EFAULT`。
+  超时 → `-ETIMEDOUT`、对端 RST → `-ECONNREFUSED`（对端半关闭后仍可单向发送）；用户指针先校验（`sockaddr` 要求可读、`recv` 缓冲要求可写），否则 `-EFAULT`。
 - 单次 I/O 上限与 `read`/`write` 相同（`abi::limits::IO_MAX`），`len == 0` 直接返回 0。
 - 验收程序 `/bin/tcpecho`（`user/tcpecho`）：`connect` 连宿主回声服务，两轮往返分别走
-  `sendto`/`recvfrom` 与 `write`/`read`（`make test-network` 的后 10 项）。
+  `sendto`/`recvfrom` 与 `write`/`read`，再加一轮 3000 B（> MSS）载荷用 512 B 小缓冲读
+  （验证未交付字节不被 ACK 吞掉；`make test-network` 的后 11 项）。
 
 ## 3. errno 常量
 
@@ -362,7 +363,7 @@ isize recvfrom(i32 fd, u8 *buf, usize len)         // 首段即返；0 = 对端�
 | `socket` | `fn socket(domain: u16, ty: i32, protocol: i32) -> isize` | 只认 `AF_INET`/`SOCK_STREAM`/`IPPROTO_TCP`，返回 fd ≥ 16（TCP 补齐） |
 | `connect` | `fn connect(fd: i32, addr: &[u8; 16]) -> isize` | 三次握手，未绑定时自动分配临时端口（TCP 补齐） |
 | `bind` | `fn bind(fd: i32, addr: &[u8; 16]) -> isize` | 只固定本地端口，地址须全 0（TCP 补齐） |
-| `sendto` | `fn sendto(fd: i32, buf: &[u8]) -> isize` | 已连接套接字上全发（TCP 补齐） |
+| `sendto` | `fn sendto(fd: i32, buf: &[u8]) -> isize` | 已连接套接字上发送，返回已确认字节数（TCP 补齐） |
 | `recvfrom` | `fn recvfrom(fd: i32, buf: &mut [u8]) -> isize` | 首段即返，0 = 对端有序关闭（TCP 补齐） |
 | `sockaddr_in` | `fn sockaddr_in(ip: [u8; 4], port: u16) -> [u8; 16]` | 16 字节地址构造器（family LE + port BE + addr + 补 0） |
 | `storage_volumes` | `fn storage_volumes(buf: &mut [u8], out_count: Option<&mut u64>) -> isize` | 定长 64 字节记录（CSS-1，`volume_*` 解析器） |

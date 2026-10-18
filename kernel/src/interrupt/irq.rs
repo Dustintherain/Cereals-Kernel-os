@@ -184,7 +184,9 @@ unsafe extern "C" fn irq0_callback(vector: u8) {
     };
 
     // 心跳只做节流打印，不能提前 return —— 每个 tick 都必须进入调度记账。
-    if tick % HEARTBEAT_INTERVAL_TICKS == 0 {
+    // 只在行边界输出：前台日志是多次 `print` 拼出来的一行，插在中间会把
+    // 串口上的断言子串劈断（`user: prIRQ0_heartbeat…ogram=/init`）。
+    if tick % HEARTBEAT_INTERVAL_TICKS == 0 && !crate::driver::serial::line_open() {
         if unsafe { serial_debug_enter() } {
             crate::driver::serial::print("IRQ0_heartbeat tick=");
             crate::driver::serial::print_dec(tick);

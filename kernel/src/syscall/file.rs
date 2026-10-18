@@ -244,6 +244,11 @@ unsafe fn read_stdin(space: *const UserSpace, buf: u64, count: u64) -> i64 {
             return n as i64;
         }
         if unsafe { clock::tick_count() } >= deadline {
+            // 等待循环里开过中断（`sti; hlt`）：返回前必须恢复「handler 关中断」的约定，
+            // 否则后续 syscall 入口会在 IF=1 下运行（入口在切内核栈之前还可能用用户栈）。
+            unsafe {
+                core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+            }
             serial::print("user: read fd=0 idle (no line within ");
             serial::print_dec(STDIN_IDLE_TICKS);
             serial::println(" ticks)");
@@ -369,12 +374,21 @@ pub unsafe fn sys_open(args: &[u64; 5], space: *const UserSpace) -> i64 {
             return vfs::EINVAL;
         }
     };
+    // 先规范化再做任何判定：能力判定用**同一条**路径，不能一边看原始字符串
+    // （``//etc/x`` 不匹配前缀）一边让 fd 表按规范化后的 ``/etc/x`` 打开文件。
+    let path = match vfs::normalize(path) {
+        Ok(path) => path,
+        Err(errno) => {
+            serial::println("user: open rejected (invalid path)");
+            return errno;
+        }
+    };
 
     // 判定点 1（能力，EPERM）+ v1.0 mode 判定（EACCES）：都在分配 fd 之前
-    let errno = enforce_open(path, flags);
+    let errno = enforce_open(&path, flags);
     if errno != 0 {
         serial::print("user: open path=");
-        serial::print(path);
+        serial::print(&path);
         serial::print(" flags=");
         serial::print_hex(flags as u64);
         serial::print(" errno=");
@@ -383,10 +397,10 @@ pub unsafe fn sys_open(args: &[u64; 5], space: *const UserSpace) -> i64 {
         return errno;
     }
 
-    match fdtable::open(path, flags) {
+    match fdtable::open(&path, flags) {
         Ok(fd) => {
             serial::print("user: open path=");
-            serial::print(path);
+            serial::print(&path);
             serial::print(" flags=");
             serial::print_hex(flags as u64);
             serial::print(" fd=");
@@ -396,7 +410,7 @@ pub unsafe fn sys_open(args: &[u64; 5], space: *const UserSpace) -> i64 {
         }
         Err(errno) => {
             serial::print("user: open path=");
-            serial::print(path);
+            serial::print(&path);
             serial::print(" errno=");
             serial::print_dec(errno.unsigned_abs());
             serial::println("");

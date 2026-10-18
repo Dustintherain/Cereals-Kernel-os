@@ -345,8 +345,11 @@ pub unsafe fn sys_exec(args: &[u64; 5], space: *const UserSpace) -> i64 {
     }
     unsafe { cpu::write_cr3(new_root) };
     drop(old_space);
-    // fd 表仍是全局的：换映像等于换进程，继承的 fd 全部失效（见模块文档）
+    // fd 表与套接字表都是全局的：换映像等于换进程，继承的 fd 全部失效（见模块文档）。
+    // 套接字必须一起清：否则新映像能按 fd 16..23 读写旧程序的已连接 TCP 连接，
+    // 槽位也会一轮轮泄漏（8 个之后 `socket()` 报 ENOSPC）。
     crate::fs::file::reset();
+    crate::network::socket::reset();
 
     serial::print("user: exec pid=");
     serial::print_dec(process::process_mut(slot).map(|p| p.pid).unwrap_or(0));
@@ -414,9 +417,17 @@ pub unsafe fn sys_sleep(args: &[u64; 5], _space: *const UserSpace) -> i64 {
         }
         spins += 1;
         if spins > SLEEP_MAX_SPINS {
+            // 见下方：返回前必须重新关中断（handler 的入口约定是 IF=0）。
+            unsafe {
+                core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+            }
             serial::println("user: sleep aborted (timer not advancing)");
-            return -4; // -EINTR
+            return abi::errno::EINTR;
         }
+    }
+    // 等待循环开过中断；恢复 handler 的「关中断」约定之后再打印/返回。
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
     }
 
     let elapsed = unsafe { clock::tick_count() } - start;
@@ -443,14 +454,14 @@ pub unsafe fn sys_sleep(args: &[u64; 5], _space: *const UserSpace) -> i64 {
 fn build_user_frame(space: &UserSpace, entry: u64, args: &[&[u8]]) -> Result<UserFrame, i64> {
     let total: u64 = args.iter().map(|a| a.len() as u64 + 1).sum();
     if total > ARG_MAX_BYTES {
-        return Err(-7); // -E2BIG
+        return Err(abi::errno::E2BIG);
     }
     let mut cursor = USER_STACK_TOP - 128;
     let mut pointers = [0u64; ARG_MAX as usize + 1];
     for (i, arg) in args.iter().enumerate() {
         cursor -= arg.len() as u64 + 1;
         if cursor < USER_STACK_TOP - ARG_MAX_BYTES {
-            return Err(-7);
+            return Err(abi::errno::E2BIG);
         }
         space.stack_write(cursor, arg);
         space.stack_write(cursor + arg.len() as u64, &[0]);
@@ -460,7 +471,7 @@ fn build_user_frame(space: &UserSpace, entry: u64, args: &[&[u8]]) -> Result<Use
     let count = args.len() + 1;
     let argv_base = argv_top - (count as u64) * 8;
     if argv_base < USER_STACK_TOP - ARG_MAX_BYTES {
-        return Err(-7);
+        return Err(abi::errno::E2BIG);
     }
     let mut bytes = [0u8; (ARG_MAX as usize + 1) * 8];
     for (i, ptr) in pointers[..count].iter().enumerate() {
