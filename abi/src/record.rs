@@ -17,7 +17,7 @@
 //! | R6 | 掩码自洽（`PROT_MASK` / `MAP_SUPPORTED` / `O_ALLOWED`） | 内核用掩码拒绝未知位 |
 //! | R7 | 盘符/容量哨兵不与合法值冲突 | `LETTER_NONE` 必须不是 A–Z |
 
-use crate::{ckm, dirent, flags, procinfo, syscall, volume};
+use crate::{ckm, dirent, flags, procinfo, sock, syscall, volume};
 
 /// 所有记录里最大的一条（自测与文档用；页内对齐的下界检查见 R3）。
 pub const MAX_RECORD_SIZE: usize = {
@@ -74,7 +74,10 @@ const _: () = assert!(syscall::CERLESSE_SEGMENT_START == 256);
 const _: () = assert!(syscall::SYS_MAX > syscall::SYS_STORAGE_FORMAT);
 const _: () = assert!(syscall::SYS_MAX > syscall::SYS_CKM_POLICY_SET);
 const _: () = assert!(syscall::SYS_MAX == 267);
-const _: () = assert!(syscall::NAMED.len() == 26);
+const _: () = assert!(syscall::NAMED.len() == 31);
+// R8：`sockaddr_in` 定长 16 字节（family 2 + port 2 + addr 4 + zero 8）。
+const _: () = assert!(sock::SOCKADDR_IN_LEN == 16);
+const _: () = assert!(sock::ADDR_OFFSET + 4 + 8 == sock::SOCKADDR_IN_LEN);
 
 // R6：掩码自洽（内核按掩码拒未知位，掩码少一位就会静默接受）。
 const _: () = assert!(flags::PROT_MASK == flags::PROT_READ | flags::PROT_WRITE | flags::PROT_EXEC);

@@ -278,6 +278,29 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
         }
     }
 
+    // 驱动兼容性（v1.0）：AHCI/SATA —— 真实机器上的磁盘控制器。
+    //
+    // 端口上真的有盘时，跑的是 `driver::block::selftest` —— **与 virtio-blk
+    // 同一套验收**（引导扇区 / 跨搬运边界的分块读 / 末扇区写回读后还原 / 负例），
+    // 因此「SATA 这条路也能读写」不是日志措辞，而是同一批断言在另一条路径上成立。
+    // 没有盘时不跑（总线上有控制器、没插盘是常态），并明确打印出来。
+    if let Some(index) = driver::ahci::block_index() {
+        driver::serial::print("ahci: running the block selftest on the SATA disk (block index=");
+        driver::serial::print_dec(index as u64);
+        driver::serial::println(")");
+        let Some(sata) = driver::block::get(index) else {
+            driver::serial::println("ahci: FAIL: the SATA disk is missing from the block registry");
+            halt();
+        };
+        if let Err(err) = driver::block::selftest(sata) {
+            driver::serial::print("ahci: FAIL: ");
+            driver::serial::println(err);
+            halt();
+        }
+    } else {
+        driver::serial::println("ahci: no SATA drive attached; skipping the SATA block selftest");
+    }
+
     // CKM-2（第二步）：可写持久化状态区 —— 系统盘尾部 1 MiB 的双槽 A/B 区。
     //
     // 位置必须在块设备注册（驱动探测）之后：状态区是**扇区级**的原始区，不在任何

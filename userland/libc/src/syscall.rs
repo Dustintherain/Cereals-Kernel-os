@@ -697,6 +697,120 @@ pub fn volume_mounts(buf: &[u8], index: usize) -> u32 {
     }
 }
 
+// ---------------------------------------------------------------- Socket（TCP 补齐）
+
+/// `socket` 的系统调用号（Linux x86_64 号 41；只认 `AF_INET` + `SOCK_STREAM` + TCP）。
+pub const SYS_SOCKET: u64 = abi::syscall::SYS_SOCKET;
+/// `connect` 的系统调用号（Linux 号 42）。
+pub const SYS_CONNECT: u64 = abi::syscall::SYS_CONNECT;
+/// `sendto` 的系统调用号（Linux 号 44）。
+pub const SYS_SENDTO: u64 = abi::syscall::SYS_SENDTO;
+/// `recvfrom` 的系统调用号（Linux 号 45）。
+pub const SYS_RECVFROM: u64 = abi::syscall::SYS_RECVFROM;
+/// `bind` 的系统调用号（Linux 号 49）。
+pub const SYS_BIND: u64 = abi::syscall::SYS_BIND;
+/// 地址族：IPv4（本内核唯一支持的族）。
+pub const AF_INET: u16 = abi::sock::AF_INET;
+/// 套接字类型：字节流（TCP）。
+pub const SOCK_STREAM: i32 = abi::sock::SOCK_STREAM;
+/// 协议：TCP（传 0 等价于选它，见内核 `network::socket::create`）。
+pub const IPPROTO_TCP: i32 = abi::sock::IPPROTO_TCP;
+/// `sockaddr_in` 长度（16 字节；内核要求 `addr_len` 精确等于它）。
+pub const SOCKADDR_IN_LEN: usize = abi::sock::SOCKADDR_IN_LEN;
+/// `-EAFNOSUPPORT`：不支持的地址族/类型/协议。
+pub const EAFNOSUPPORT: isize = abi::errno::EAFNOSUPPORT as isize;
+/// `-ENOTCONN`：套接字未连接（`send`/`recv` 之前必须先 `connect`）。
+pub const ENOTCONN: isize = abi::errno::ENOTCONN as isize;
+/// `-ETIMEDOUT`：TCP 握手/收发超时（重传耗尽）。
+pub const ETIMEDOUT: isize = abi::errno::ETIMEDOUT as isize;
+/// `-ECONNREFUSED`：对端 RST（端口未监听或连接被拒绝）。
+pub const ECONNREFUSED: isize = abi::errno::ECONNREFUSED as isize;
+
+/// `sockaddr_in(ip, port)`：把地址写进 16 字节数组（family LE + port BE + addr + 补 0）。
+///
+/// 布局的权威定义在 `abi::sock`，这里只是调用侧的构造器 ——
+/// 用户程序不该自己拼偏移（字节序错一位就是连不上的 `-ETIMEDOUT`）。
+pub fn sockaddr_in(ip: [u8; 4], port: u16) -> [u8; 16] {
+    let mut addr = [0u8; SOCKADDR_IN_LEN];
+    addr[abi::sock::FAMILY_OFFSET..abi::sock::FAMILY_OFFSET + 2]
+        .copy_from_slice(&AF_INET.to_le_bytes());
+    addr[abi::sock::PORT_OFFSET..abi::sock::PORT_OFFSET + 2]
+        .copy_from_slice(&port.to_be_bytes());
+    addr[abi::sock::ADDR_OFFSET..abi::sock::ADDR_OFFSET + 4].copy_from_slice(&ip);
+    addr
+}
+
+/// `socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)`：分配套接字，返回 fd（≥ 16）或负 errno。
+///
+/// 套接字 fd 与文件 fd 是**两个号段**（16..=23 vs 0..=15），但 `read`/`write`/`close`
+/// 通用：`read` = `recv`（首段即返），`write` = `send`（全发）。
+pub fn socket(domain: u16, ty: i32, protocol: i32) -> isize {
+    unsafe { raw(SYS_SOCKET, domain as u64, ty as u64, protocol as u64, 0, 0) }
+}
+
+/// `connect(fd, addr)`：三次握手（阻塞到建立或失败；失败的 errno 见上）。
+///
+/// `addr` 用 [`sockaddr_in`] 构造。未分配本地端口时内核从临时段自动分配。
+pub fn connect(fd: i32, addr: &[u8; 16]) -> isize {
+    unsafe {
+        raw(
+            SYS_CONNECT,
+            fd as u64,
+            addr.as_ptr() as u64,
+            SOCKADDR_IN_LEN as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// `bind(fd, addr)`：固定本地端口（地址只接受全 0 的 bind-any）。
+pub fn bind(fd: i32, addr: &[u8; 16]) -> isize {
+    unsafe {
+        raw(
+            SYS_BIND,
+            fd as u64,
+            addr.as_ptr() as u64,
+            SOCKADDR_IN_LEN as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// `sendto(fd, buf)`：已连接套接字上全发，返回发送字节数（负数 = errno）。
+///
+/// 地址参数固定传 `NULL`（内核要求）：已连接字节流不接受逐包目的地址，
+/// 传了就是 `-EINVAL`。单次上限与 `write` 一致（`IO_MAX` = 4096）。
+pub fn sendto(fd: i32, buf: &[u8]) -> isize {
+    unsafe {
+        raw(
+            SYS_SENDTO,
+            fd as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// `recvfrom(fd, buf)`：首段即返，返回收到字节数（`0` = 对端有序关闭；负数 = errno）。
+///
+/// 同 `sendto`：地址回填未实现，固定传 `NULL`。要收满整段请循环调用。
+pub fn recvfrom(fd: i32, buf: &mut [u8]) -> isize {
+    unsafe {
+        raw(
+            SYS_RECVFROM,
+            fd as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        )
+    }
+}
+
 // ---------------------------------------------------------------- CKM（CKM-1）
 
 /// `ckm_policy_query` 的系统调用号（CKM-1，`docs/ckm.md` 4.3）。

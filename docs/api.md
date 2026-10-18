@@ -48,6 +48,11 @@
 | 12 | `brk` | ✅ | 调整用户堆顶（Linux 语义） |
 | 35 | `nanosleep` | ✅ | 睡眠 N 个 PIT tick（100Hz） |
 | 39 | `getpid` | ✅ | 当前进程 PID |
+| 41 | `socket` | ✅ | 只认 `AF_INET` + `SOCK_STREAM` + `IPPROTO_TCP`，返回套接字 fd（16..=23） |
+| 42 | `connect` | ✅ | TCP 三次握手（阻塞到建立或失败）；RST → `-ECONNREFUSED`，超时 → `-ETIMEDOUT` |
+| 44 | `sendto` | ✅ | 已连接套接字上全发；地址参数必须为 0（只做已连接字节流） |
+| 45 | `recvfrom` | ✅ | 首段即返（`0` = 对端有序关闭）；地址回填未实现，传 0 |
+| 49 | `bind` | ✅ | 固定本地端口（地址只收全 0；未绑定时 `connect` 自动分配临时端口） |
 | 57 | `fork` | ✅ | 复制当前进程 |
 | 59 | `execve` | ✅ | 换映像（成功后不返回） |
 | 60 | `exit` | ✅ | 结束进程并交回退出码 |
@@ -273,6 +278,37 @@ isize ckm_component_state(u8 *buf, usize buf_len, u64 *out_count, 0, 0)
 记录的权威定义在内核（`kernel/src/ckm/{audit,state}.rs`），用户态只镜像一次解析器
 （`libc::ckm_record_*` / `component_*`），**不自己算偏移**。
 
+### 2.18 Socket/TCP 最小集（nr=41/42/44/45/49，v1.0 TCP 补齐）
+
+只做「已连接 TCP 字节流」这一个子集（客户端方向；`listen`/`accept` 等服务端号仍为 ENOSYS 桩，
+连名字都未发布）。后端是内核 `network::socket` 的 8 槽套接字表，fd 落独立号段 **16..=23**
+（不与文件 fd 重叠）；`read`/`write`/`close` 对套接字 fd 同样有效（`read` = `recv` 首段即返，
+`write` = `send` 全发，`close` 先发 FIN 再释放槽位）。
+
+```
+isize socket(u16 domain, i32 type, i32 protocol)   // 只认 AF_INET(2) + SOCK_STREAM(1) + IPPROTO_TCP(6)/0
+isize connect(i32 fd, u8 addr[16])                // 三次握手；未 bind 时从临时段自动分配本地端口
+isize bind(i32 fd, u8 addr[16])                   // 只固定本地端口，地址须是全 0（bind-any）
+isize sendto(i32 fd, u8 *buf, usize len)           // 已连接套接字上全发（按 MSS 切块、每块等累积 ACK）
+isize recvfrom(i32 fd, u8 *buf, usize len)         // 首段即返；0 = 对端有序关闭
+```
+
+- 地址是 16 字节 `sockaddr_in`（`libc::sockaddr_in(ip, port)` 构造；`addr_len != 16` 即 `-EINVAL`，
+  `family != AF_INET` 即 `-EAFNOSUPPORT`，`port == 0` 即 `-EINVAL`）：
+
+| 偏移 | 大小 | 字段 | 字节序 |
+| ---- | ---- | ---- | ---- |
+| 0 | 2 | `family`（= 2） | 小端 |
+| 2 | 2 | `port` | 大端 |
+| 4 | 4 | IPv4 地址 | 原样 |
+| 8 | 8 | 补 0 | — |
+
+- `sendto`/`recvfrom` 带地址（指针非 0）一律 `-EINVAL`；未 `connect` 就收发 → `-ENOTCONN`；
+  对端已 FIN 还要发 → `-EIO`；用户指针先校验（`sockaddr` 要求可读、`recv` 缓冲要求可写），否则 `-EFAULT`。
+- 单次 I/O 上限与 `read`/`write` 相同（`abi::limits::IO_MAX`），`len == 0` 直接返回 0。
+- 验收程序 `/bin/tcpecho`（`user/tcpecho`）：`connect` 连宿主回声服务，两轮往返分别走
+  `sendto`/`recvfrom` 与 `write`/`read`（`make test-network` 的后 10 项）。
+
 ## 3. errno 常量
 
 | 数值 | 名称 | 含义 | 用户态 `libc` 导出 |
@@ -291,7 +327,11 @@ isize ckm_component_state(u8 *buf, usize buf_len, u64 *out_count, 0, 0)
 | -22 | `EINVAL` | 参数非法 | ✅ |
 | -28 | `ENOSPC` | 空间/句柄不足 | ✅ |
 | -30 | `EROFS` | 只读文件系统 | — |
-| -38 | `ENOSYS` | 号合法但未实现（v1.0 第一步实现 `mprotect` 后无此类调用；保留给后续新增号） | ✅ |
+| -38 | `ENOSYS` | 号合法但未实现（v1.0 第一步实现 `mprotect` 后只剩 `ckm_policy_set`(260)/`storage_format`(266) 两个 ENOSYS 桩） | ✅ |
+| -97 | `EAFNOSUPPORT` | 不支持的地址族/类型/协议（socket 只认 `AF_INET` + `SOCK_STREAM` + TCP） | ✅ |
+| -107 | `ENOTCONN` | 套接字未连接（`send`/`recv` 之前必须先 `connect`） | ✅ |
+| -110 | `ETIMEDOUT` | TCP 握手/收发超时（重传耗尽，对端无应答） | ✅ |
+| -111 | `ECONNREFUSED` | 对端 RST（端口未监听或连接被拒绝） | ✅ |
 | -117 | `EUCLEAN` | 磁盘结构损坏（簇链断/越界/目录项非法） | — |
 
 ## 4. 用户态 `libc` API
@@ -319,6 +359,12 @@ isize ckm_component_state(u8 *buf, usize buf_len, u64 *out_count, 0, 0)
 | `wait4` | `fn wait4(pid: i64) -> isize` | 返回退出码或 `ECHILD` |
 | `getdents` | `fn getdents(path: &str, buf: &mut [u8]) -> isize` | 定长 88 字节记录（`dirent_*` 解析器） |
 | `getprocs` | `fn getprocs(buf: &mut [u8]) -> isize` | 定长 40 字节记录（`procinfo_*` 解析器） |
+| `socket` | `fn socket(domain: u16, ty: i32, protocol: i32) -> isize` | 只认 `AF_INET`/`SOCK_STREAM`/`IPPROTO_TCP`，返回 fd ≥ 16（TCP 补齐） |
+| `connect` | `fn connect(fd: i32, addr: &[u8; 16]) -> isize` | 三次握手，未绑定时自动分配临时端口（TCP 补齐） |
+| `bind` | `fn bind(fd: i32, addr: &[u8; 16]) -> isize` | 只固定本地端口，地址须全 0（TCP 补齐） |
+| `sendto` | `fn sendto(fd: i32, buf: &[u8]) -> isize` | 已连接套接字上全发（TCP 补齐） |
+| `recvfrom` | `fn recvfrom(fd: i32, buf: &mut [u8]) -> isize` | 首段即返，0 = 对端有序关闭（TCP 补齐） |
+| `sockaddr_in` | `fn sockaddr_in(ip: [u8; 4], port: u16) -> [u8; 16]` | 16 字节地址构造器（family LE + port BE + addr + 补 0） |
 | `storage_volumes` | `fn storage_volumes(buf: &mut [u8], out_count: Option<&mut u64>) -> isize` | 定长 64 字节记录（CSS-1，`volume_*` 解析器） |
 | `storage_rescan` | `fn storage_rescan(disk_index: u32) -> isize` | `u32::MAX` = 全部（CSS-1） |
 | `storage_mount` | `fn storage_mount(vol_id: &str, point: &str, read_only: bool) -> isize` | 需 `CAP_STORAGE_ADMIN`（CSS-3） |
@@ -339,7 +385,10 @@ isize ckm_component_state(u8 *buf, usize buf_len, u64 *out_count, 0, 0)
 - `open` 标志：`O_RDONLY = 0`、`O_WRONLY = 1`、`O_RDWR = 2`、`O_CREAT = 0o100`。
 - `mmap`/`mprotect` 保护位：`PROT_NONE = 0x0`、`PROT_READ = 0x1`、`PROT_WRITE = 0x2`、`PROT_EXEC = 0x4`。
 - `mmap` 标志：`MAP_PRIVATE = 0x2`、`MAP_ANONYMOUS = 0x20`。
-- errno：`ENOENT/EBADF/ECHILD/EAGAIN/ENOMEM/EFAULT/EISDIR/EINVAL/ENOSPC/ENOSYS/EPERM/EACCES`（数值见第 3 节）。
+- errno：`ENOENT/EBADF/ECHILD/EAGAIN/ENOMEM/EFAULT/EISDIR/EINVAL/ENOSPC/ENOSYS/EPERM/EACCES` +
+  socket/TCP：`EAFNOSUPPORT/ENOTCONN/ETIMEDOUT/ECONNREFUSED`（数值见第 3 节）。
+- socket/TCP（TCP 补齐）：`AF_INET = 2`、`SOCK_STREAM = 1`、`IPPROTO_TCP = 6`（传 0 等价）、
+  `SOCKADDR_IN_LEN = 16`；套接字 fd 号段 16..=23（不与文件 fd 重叠）。
 - CKM（CKM-1）：能力位 `CAP_CKM_ADMIN = 0x1`、`CAP_CKM_SERVICE = 0x2`、`CAP_FS_SYSTEM_WRITE = 0x4`、
   `CAP_AUDIT_READ = 0x8`、`CAP_STORAGE_ADMIN = 0x10`、`CAP_STORAGE_FORMAT = 0x20`；
   op 枚举 `CKM_OP_FS_WRITE = 1` … `CKM_OP_STORAGE_RESCAN = 16`；
@@ -501,8 +550,8 @@ serialmon 退出码：`0` 通过、`1` 异常/缺失、`2` 用法或 IO 错误�
 ```bash
 make build / make run            # 构建镜像 / QEMU + OVMF 启动
 make test ... test-network       # 各集成测试（断言串口日志）
-make test-all                    # test + exception + memory + pagefault + keyboard + shell + proc
-                                 #   + programs + dyn + scheduler + ipc + fs + user + ckm + driver + fat + network
+make test-all                    # 纯内核全量回归（19 目标）：abi-check + check-boundary + 各 test-*
+                                 #   （含 driver / ahci / fat / storage / network）
 make dyn-hostcheck               # 转发到 `make -C userland dyn-hostcheck`：动态链接夹具的宿主 glibc 独立复核（缺工具则跳过）
 make userland-images / make user # 在 userland/ 里构建 + 校验全部用户程序（不启 QEMU、不需要内核源码）
 make image-kernel / test-kernel-only # 纯内核：不内嵌用户态的镜像 / 断言内核单独启动到诊断空闲
@@ -523,18 +572,19 @@ make clean
 | `test-scheduler` | Round Robin 轮转 | — |
 | `test-ipc` | pipe 创建/写/读 | — |
 | `test-fs` | VFS 路由 + RAMFS 读/写/ls + 负例 | 21 |
-| `test-user` | ELF 装载 + 文件 syscall + 用户堆 + `mprotect`（`PROT_NONE`/`RX` 转换）+ 隔离 + Shell + 动态链接 + `/init` 的 CKM-1 证据 | 91 |
+| `test-user` | ELF 装载 + 文件 syscall + 用户堆 + `mprotect`（`PROT_NONE`/`RX` 转换）+ 隔离 + Shell + 动态链接 + `/init` 的 CKM-1 证据 | 96 |
 | `test-ckm` | CKM-1：内核能力判定自测（46 项）+ `/init` 的允许/拒绝 + 组件枚举确定性 + 审计环回绕 | 22 + 2 正则 |
 | `test-shell` | 交互式 Shell（注入按键） | 11 |
 | `test-proc` | fork/execve/wait4 全链路 + PID 一致性 | 8 + 4 正则 |
-| `test-programs` | getdents/getprocs + 基础用户程序（含 `/bin/volumes`）真的被 exec | 23 + 6 正则 |
+| `test-programs` | getdents/getprocs + 基础用户程序（含 `/bin/volumes`、`/bin/tcpecho` 的目录项）真的被 exec | 33 + 7 正则 |
 | `storage-images` | 生成 GPT/MBR/主表损坏/无表四类夹具镜像（不启 QEMU） | — |
 | `test-storage-fixtures` | 夹具结构断言（GPT 主/备表头 + CRC、MBR 四主分区 + EBR 链） | — |
 | `test-storage` | 卷枚举确定性 + 无分区表退化 + 只读原因 + `degraded`（GPT 场景） | 26 |
 | `test-storage-mbr` | MBR 场景：EBR 链 + 未识别文件系统仍可见 | 13 |
-| `test-network` | virtio-net → Ethernet/ARP/IPv4/UDP（DHCP 往返） | 13 |
+| `test-network` | virtio-net → Ethernet/ARP/IPv4/UDP（DHCP 往返）+ TCP 三次握手/收发/关闭 + `/bin/tcpecho` 双轮回显 | 23 |
 | `test-dyn` | PT_INTERP + DT_NEEDED + RELATIVE/JUMP_SLOT（内核侧最小动态链接） | 10 |
-| `test-driver` | PCI 枚举 + 驱动挂接 + 扇区读写/负例 | 22 |
+| `test-driver` | PCI 枚举 + 驱动挂接 + 扇区读写/负例 | 23 |
+| `test-ahci` | AHCI/SATA：按类别匹配 + IDENTIFY（型号/容量）+ **同一套**块设备验收 + SATA 上的 FAT 挂载 | 24 |
 | `test-fat` | 双盘 FAT16/32 读/LFN/跨簇/偏移/EROFS | 21 |
 | `test-pkg` | `.ckc` 容器规则 + `tar` 独立复核 | 37 |
 
@@ -542,6 +592,8 @@ make clean
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-14 | **Socket/TCP 补齐（41/42/44/45/49 + 内核 TCP 客户端最小集 + `/bin/tcpecho`）**：号表新增 41/42/44/45/49 五个 ✅ 行；新增 2.18（子集声明 + `sockaddr_in` 布局 + `read`/`write`/`close` 路由 + `/bin/tcpecho` 验收）；errno 表新增 -97/-107/-110/-111；4.1 新增五个封装 + `sockaddr_in` 构造器、4.2 新增 socket 常量与 fd 号段；第 7 节 `test-network` 13 → **23**、`test-user` 91 → **96**、`test-programs` 23 + 6 → **33 + 7**（实现细节见 syscall.md 3.13 修订行） |
+| 2026-10-14 | **v1.0 驱动兼容性（AHCI/SATA + B-18）**：第 7 节新增 `test-ahci`（24 项）、`test-driver` 22 → 23，`make test-all` 说明改为纯内核 19 目标；`tests/test_boot.py` 新增 `--ahci`/`--ahci-disk`；PCI 头部类型偏移修正（`0x0C` → `0x0E`）让多功能设备的 function 1..7 真的被枚举 |
 | 2026-10-12 | **CKM-1（内核级权限控制）**：号表新增 `ckm_policy_query`(257)/`ckm_audit_read`(258)/`ckm_component_state`(259) 与 `ckm_policy_set`(260) 的 ENOSYS 行；新增 2.15/2.16/2.17（op 枚举、48/64 字节记录布局、errno）；4.1/4.2 新增 `libc` 封装、解析器与 `CAP_*`/`CKM_OP_*`/`EPERM`/`EACCES`/记录尺寸常量；号段说明改为「257–259 已实现」；第 7 节新增 `test-ckm`（22 + 2 正则）并标注 `test-user` 包含 CKM 证据 |
 | 2026-10-11 | **CSS-2（VFS 收口）**：5.1 节的 `FileSystem` 补 `caps`/`volume_info`（保守缺省）、`FatFs::open` 的错误类型改为 `OpenError { errno, reason }`、VFS 入口提 `route`/`backend_caps`/`backend_volume_info`、挂载表改为 `backends`+`mounts` 并补 `mount_volume`/`alias_volume`/`umount`；5.3 号表行标注 262–264 的内核落点已先备好 |
 | 2026-10-11 | 创建本文档：汇总系统调用 ABI（寄存器约定/号表/逐条语义）、errno 表、`libc` API、

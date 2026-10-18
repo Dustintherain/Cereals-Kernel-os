@@ -21,8 +21,10 @@
 import argparse
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -71,6 +73,25 @@ def parse_args() -> argparse.Namespace:
         help="v0.9 test-network：加一块 legacy virtio-net-pci 网卡（QEMU user/slirp 网络）",
     )
     parser.add_argument(
+        "--tcp-echo-port",
+        type=int,
+        default=None,
+        help="TCP 验收的宿主侧一半：在宿主 0.0.0.0 上起回声服务（发什么回什么），"
+        "内核经 slirp 网关 10.0.2.2 连它（端口须与 kernel/src/network/mod.rs::TCP_ECHO_PORT 一致）",
+    )
+    parser.add_argument(
+        "--ahci",
+        action="store_true",
+        help="v1.0 test-ahci：把一块盘挂到 q35 内建的 ICH9 AHCI 控制器（00:1f.2）的 2 号端口上；"
+        "内核的 SATA 驱动（kernel/src/driver/ahci.rs）会认领它不是 virtio-blk",
+    )
+    parser.add_argument(
+        "--ahci-disk",
+        default=str(BUILD / "fat.img"),
+        help="挂到 AHCI 端口上的盘（默认 build/fat.img：同一张 FAT32 镜像因此可以由 virtio 与 SATA "
+        "两条完全不同的驱动路径读，文件内容互相印证）",
+    )
+    parser.add_argument(
         "--persist",
         action="store_true",
         help="blk0 **不加** `snapshot=on`：写真的落盘（CKM-2 的持久化自测需要它，"
@@ -91,6 +112,7 @@ def main() -> int:
     disk = Path(args.disk)
     disk2 = Path(args.disk2) if args.disk2 else None
     extra = [Path(p) for p in args.extra_disk]
+    ahci_disk = Path(args.ahci_disk) if args.ahci else None
     expects = [s.encode() for s in (args.expect or ["Kernel started!"])]
     regexes = args.expect_re or []
     serial_log = Path(args.serial_log) if args.serial_log else BUILD / "serial.log"
@@ -109,6 +131,9 @@ def main() -> int:
         if not path.is_file():
             print(f"FAIL: extra disk image not found: {path} (run `make storage-images` first)")
             return 2
+    if ahci_disk is not None and not ahci_disk.is_file():
+        print(f"FAIL: AHCI disk image not found: {ahci_disk} (run `make fat-image` first)")
+        return 2
 
     BUILD.mkdir(parents=True, exist_ok=True)
     vars_copy = Path(args.ovmf_vars) if args.ovmf_vars else BUILD / "OVMF_VARS.fd"
@@ -151,6 +176,17 @@ def main() -> int:
             "-device", f"virtio-blk-pci,drive=blk{index},disable-modern=on",
         ]
 
+    if ahci_disk is not None:
+        # v1.0：q35 的内建芯片组本身就带一个 ICH9 AHCI 控制器（00:1f.2 / 8086:2922 /
+        # class 0x01 subclass 0x06 prog_if 0x01），因此不需要再加控制器，只要把一块盘
+        # 插到它的端口上。q35 的 SATA 端口在 QEMU 里叫 `ide.0`..`ide.5`（不是 `sata.N`），
+        # 2 号端口与固件引导日志里的 `Pci(0x1F,0x2)/Sata(0x2,...)` 是同一个端口。
+        # 盘仍然用 snapshot=on：测试不污染共享的 fat.img。
+        cmd[cmd.index("-serial"):cmd.index("-serial")] = [
+            "-drive", f"if=none,id=ahci0,format=raw,file={ahci_disk},snapshot=on",
+            "-device", "ide-hd,drive=ahci0,bus=ide.2",
+        ]
+
     if args.nic:
         # v0.9：网络验收用 `-netdev user`（slirp）—— 它自带 DHCP 服务器与虚拟网关，
         # 因此 ARP + DHCP 的 UDP 往返不需要主机侧跑任何服务。disable-modern=on
@@ -159,6 +195,16 @@ def main() -> int:
             "-netdev", "user,id=n0",
             "-device", "virtio-net-pci,netdev=n0,disable-modern=on",
         ]
+
+    # TCP 回声服务（若要求）：QEMU 起之前先在宿主监听，客户机的两次连接
+    # （内核自测 + /bin/tcpecho）都会打到它；QEMU 结束即停。
+    echo_stop = threading.Event()
+    echo_thread = None
+    if args.tcp_echo_port is not None:
+        echo_thread = threading.Thread(
+            target=_run_echo_server, args=(args.tcp_echo_port, echo_stop), daemon=True
+        )
+        echo_thread.start()
 
     print(f"running: {' '.join(cmd)}")
     timed_out = False
@@ -170,6 +216,10 @@ def main() -> int:
     except subprocess.TimeoutExpired as expired:
         timed_out = True
         output = (expired.stdout or b"") + (expired.stderr or b"")
+    finally:
+        echo_stop.set()
+        if echo_thread is not None:
+            echo_thread.join(timeout=5)
 
     serial_log.write_bytes(output)
 
@@ -204,6 +254,45 @@ def main() -> int:
     sys.stdout.buffer.flush()
     print()
     return 1
+
+
+def _run_echo_server(port: int, stop: threading.Event) -> None:
+    """TCP 回声服务（test-network 的宿主侧一半：发什么回什么，直到对端关闭）。
+
+    内核侧是两次独立连接（`net: tcp` 自测 + `/bin/tcpecho`），因此这里循环 accept
+    直到 QEMU 结束；单个连接内把收到的一字不差送回去（分段回声由内核侧拼合）。
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("0.0.0.0", port))
+    except OSError as err:
+        print(f"FAIL: tcp echo server cannot bind 0.0.0.0:{port}: {err}")
+        return
+    srv.listen(8)
+    srv.settimeout(0.5)
+    while not stop.is_set():
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            conn.settimeout(5.0)
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    break
+                conn.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+    srv.close()
 
 
 if __name__ == "__main__":

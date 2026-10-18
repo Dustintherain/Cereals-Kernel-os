@@ -20,7 +20,11 @@
 //! 缓存满了按「最久未使用」覆盖 —— v0.9 只有网关一个目标，命中率不是问题，
 //! 但把「解析一次就记住」这件事写进接口，后面的 UDP 发送路径才不必每次重新 ARP。
 
+use crate::driver::net::{self, NetworkDevice};
+use crate::driver::serial;
+use crate::network::ethernet;
 use crate::network::ipv4::Address;
+use crate::time::clock;
 
 /// ARP 报文长度（以太网 + IPv4）。
 pub const PACKET_LEN: usize = 28;
@@ -132,4 +136,80 @@ impl Cache {
         self.next = (slot + 1) % Self::CAPACITY;
     }
 
+}
+
+/// 读取 PIT tick（`clock::tick_count` 是 unsafe：调用方须处于内核态）。
+fn ticks() -> u64 {
+    // SAFETY: ARP 只在 ring0（启动自测、TCP 连接、syscall handler）里运行。
+    unsafe { clock::tick_count() }
+}
+
+/// 发一次 ARP 请求并等应答（无缓存的单次解析）。
+///
+/// [`Cache`] 命中之后调的就是它 —— [`crate::network::Stack::arp_resolve`]
+/// 先查缓存、未命中才到这里；TCP 连接（[`crate::network::tcp`]）与 socket 层
+/// 手里只有 `&mut dyn NetworkDevice` 而没有 `Stack`，因此等待循环只有这一份实现。
+///
+/// 应答的合法性检查与原来 `Stack::arp_resolve` 里的一致：只收操作码为应答、
+/// 发送方为 `target`、目的 IP/MAC 都是本机的报文（以太网目的为本机或广播）。
+pub fn resolve(
+    dev: &mut dyn NetworkDevice,
+    src_mac: [u8; 6],
+    src_ip: Address,
+    target: Address,
+    timeout_ticks: u64,
+) -> Option<[u8; 6]> {
+    let mut frame = [0u8; ethernet::HEADER_LEN + PACKET_LEN];
+    let mut arp_bytes = [0u8; PACKET_LEN];
+    build(
+        &mut arp_bytes,
+        OPER_REQUEST,
+        src_mac,
+        src_ip,
+        ethernet::ZERO_MAC,
+        target,
+    );
+    {
+        let payload =
+            ethernet::build(&mut frame, ethernet::BROADCAST_MAC, src_mac, ethernet::ETHERTYPE_ARP)?;
+        payload[..PACKET_LEN].copy_from_slice(&arp_bytes);
+    }
+    dev.transmit(&frame).ok()?;
+
+    let mut rx = [0u8; net::FRAME_MAX];
+    let start = ticks();
+    loop {
+        if ticks().wrapping_sub(start) > timeout_ticks {
+            return None;
+        }
+        let n = match dev.receive(&mut rx) {
+            Ok(Some(n)) => n,
+            Ok(None) => continue,
+            Err(_) => return None,
+        };
+        let Some(eth) = ethernet::parse(&rx[..n]) else {
+            continue;
+        };
+        if eth.ethertype != ethernet::ETHERTYPE_ARP {
+            continue;
+        }
+        let Some(packet) = parse(eth.payload) else {
+            continue;
+        };
+        if packet.oper != OPER_REPLY || packet.sender_ip != target {
+            continue;
+        }
+        // 应答必须发给我们：以太网目的为本机（或广播），且 ARP 的目的 IP / MAC 都是本机。
+        if !(eth.dst == src_mac || ethernet::is_broadcast(eth.dst)) {
+            continue;
+        }
+        if packet.target_ip != src_ip || packet.target_mac != src_mac {
+            continue;
+        }
+        // 交叉校验：帧头源 MAC 应与 ARP 报文的发送方 MAC 一致（不一致只提示，以 ARP 为准）。
+        if eth.src != packet.sender_mac {
+            serial::println("net: arp note: frame src != arp sender mac");
+        }
+        return Some(packet.sender_mac);
+    }
 }

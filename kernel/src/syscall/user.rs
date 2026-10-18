@@ -32,6 +32,8 @@
 //! - [`LS_PATH`] / [`CAT_PATH`] / [`ECHO_PATH`] / [`PS_PATH`]：**基础用户程序** —— 各自
 //!   只需要一条内核能力（`getdents` / 文件 syscall / `write` / `getprocs`），
 //!   因此同时是「用户态能不能真的用上 VFS/进程表」的验收。
+//! - [`TCPECHO_PATH`]：**socket 验收程序** —— 有网卡时才运行（`socket`/`connect`/
+//!   `sendto`/`recvfrom` + `write`/`read` 两轮回声收发），无网卡时跳过。
 //!
 //! 这些常量是**内核与用户态之间的契约**：非空清单必须提供这些路径（否则 selftest
 //! 报 `ENOENT`）；空清单则走「纯内核诊断」分支，内核不依赖用户态存在。
@@ -83,6 +85,11 @@ pub const PS_PATH: &str = "/bin/ps";
 pub const USER_FILE: &str = "/tmp/hello.txt";
 /// v0.9 动态链接主程序路径（ET_DYN PIE，见 user/dynhello/）。
 pub const DYNHELLO_PATH: &str = "/bin/dynhello";
+/// socket/TCP 用户态验收程序路径（`user/tcpecho`：connect 回声服务，两轮收发）。
+///
+/// 只在有网卡时运行（`make test-network` 的 QEMU 带 virtio-net-pci + 回声服务）；
+/// 无网卡时跳过（不是失败），因此纯内核/无网测试的串口只多一行 SKIP。
+pub const TCPECHO_PATH: &str = "/bin/tcpecho";
 /// 解释器路径（必须等于 `kernel/build.rs::DYN_INTERP` 与 `PT_INTERP`）。
 pub const LDSO_PATH: &str = "/lib/ld.so";
 /// 共享库路径（`DT_NEEDED=libgreet.so` → `/lib/libgreet.so`）。
@@ -117,8 +124,9 @@ extern "C" {
 ///
 /// 缺任何一条都说明用户态构建侧与内核期望不一致 —— 在这里一次性报出来，
 /// 而不是等到某条 `run_from_vfs` 给出一个难懂的 ENOENT。
-const REQUIRED_PROGRAM_PATHS: [&str; 8] = [
+const REQUIRED_PROGRAM_PATHS: [&str; 9] = [
     INIT_PATH, SHELL_PATH, HELLO_BIN_PATH, LS_PATH, CAT_PATH, ECHO_PATH, PS_PATH, DYNHELLO_PATH,
+    TCPECHO_PATH,
 ];
 const REQUIRED_LIBRARY_PATHS: [&str; 2] = [LDSO_PATH, LIBGREET_PATH];
 
@@ -230,6 +238,7 @@ unsafe fn run_process(
     serial::println("");
 
     fs::file::reset();
+    crate::network::socket::reset();
     unsafe {
         EXIT_CODE = -1;
         process::set_current_index(slot);
@@ -391,6 +400,23 @@ pub fn selftest() -> Result<(), &'static str> {
         return Err("dynhello did not exit(42)");
     }
     serial::println("user: dynamic link PASS (PT_INTERP + libgreet.so + RELATIVE/JUMP_SLOT)");
+
+    // 5.5) socket/TCP 用户态验收：`/bin/tcpecho` 走 `socket/connect/sendto/recvfrom`
+    //    与 `write/read` 两套形状与回声服务做两轮收发。无网卡时跳过（回声服务只在
+    //    `--nic` 启动里存在，见 `network::TCP_ECHO_PORT`），不把「没有网卡」当失败。
+    if crate::driver::net::count() == 0 {
+        serial::println("user: tcpecho SKIP (no network device)");
+    } else {
+        run_from_vfs("tcpecho", TCPECHO_PATH, 5)?;
+        let code = last_exit_code();
+        if code != 0 {
+            serial::print("user: tcpecho FAIL exit=");
+            serial::print_dec(code as u64);
+            serial::println("");
+            return Err("tcpecho did not exit(0)");
+        }
+        serial::println("user: tcpecho PASS (socket/connect/send/recv/close over TCP)");
+    }
 
     // 6) 每个进程的地址空间（含用户堆、共享库与 fork 出的子进程）都必须整棵归还
     let free_after = frame::stats().free_frames;

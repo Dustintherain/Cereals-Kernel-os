@@ -17,6 +17,7 @@
 //! | [`volume`] | `storage_*` 的 64 字节卷记录与 `flags` | 内核 `storage::volume`、libc |
 //! | [`ckm`] | CKM 记录布局、能力位、op 编号、受保护前缀 | 内核 `ckm::*`、libc |
 //! | [`record`] | **编译期**断言：尺寸/对齐/号段不重叠 | 任何引用者（编译失败即证据） |
+//! | [`sock`] | socket 域/类型/协议与 `sockaddr_in` 布局 | 内核 `network`/`syscall::net`、libc |
 //!
 //! ## 约定
 //!
@@ -41,12 +42,13 @@ pub mod flags;
 pub mod limits;
 pub mod procinfo;
 pub mod record;
+pub mod sock;
 pub mod syscall;
 pub mod volume;
 
 #[cfg(test)]
 mod tests {
-    use crate::{ckm, dirent, errno, procinfo, record, syscall, volume};
+    use crate::{ckm, dirent, errno, procinfo, record, sock, syscall, volume};
 
     /// 调用号唯一、落在 `SYS_MAX` 内、且排序后就是 [`syscall::NAMED`]。
     #[test]
@@ -77,6 +79,11 @@ mod tests {
         assert!(!syscall::is_cerlesse_segment(syscall::SYS_MAX));
         // Linux 号段里的号在本 ABI 里只能是我们自己用的那几个（不能顺手占用无关号）
         assert_eq!(syscall::SYS_READ, 0);
+        assert_eq!(syscall::SYS_SOCKET, 41);
+        assert_eq!(syscall::SYS_CONNECT, 42);
+        assert_eq!(syscall::SYS_SENDTO, 44);
+        assert_eq!(syscall::SYS_RECVFROM, 45);
+        assert_eq!(syscall::SYS_BIND, 49);
         assert_eq!(syscall::SYS_GETDENTS, 78);
         assert_eq!(syscall::SYS_GETPROCS, 256);
         assert_eq!(syscall::SYS_MAX, 267);
@@ -142,6 +149,10 @@ mod tests {
             errno::EINVAL,
             errno::ENOSPC,
             errno::ENOSYS,
+            errno::EAFNOSUPPORT,
+            errno::ENOTCONN,
+            errno::ETIMEDOUT,
+            errno::ECONNREFUSED,
         ];
         let mut sorted = all;
         sorted.sort_unstable();
@@ -151,6 +162,10 @@ mod tests {
         assert!(all.iter().all(|v| *v < 0), "errno 必须是负数");
         assert_eq!(errno::ENOSYS, -38);
         assert_eq!(errno::EPERM, -1);
+        assert_eq!(errno::EAFNOSUPPORT, -97);
+        assert_eq!(errno::ENOTCONN, -107);
+        assert_eq!(errno::ETIMEDOUT, -110);
+        assert_eq!(errno::ECONNREFUSED, -111);
     }
 
     /// CKM / 存储的字面量（能力位、op 编号、盘符哨兵）逐条固化。
@@ -213,5 +228,18 @@ mod tests {
         assert_ne!(f::PROT_WRITE, f::PROT_EXEC);
         // 受保护前缀的路径长度上限与限制模块一致
         assert_eq!(crate::limits::PATH_MAX, 256);
+    }
+
+    /// `sockaddr_in`：16 字节定长，字段偏移自洽（ family 2 + port 2 + addr 4 + zero 8）。
+    #[test]
+    fn sockaddr_in_layout() {
+        assert_eq!(sock::AF_INET, 2);
+        assert_eq!(sock::SOCK_STREAM, 1);
+        assert_eq!(sock::IPPROTO_TCP, 6);
+        assert_eq!(sock::SOCKADDR_IN_LEN, 16);
+        assert_eq!(sock::FAMILY_OFFSET, 0);
+        assert_eq!(sock::PORT_OFFSET, 2);
+        assert_eq!(sock::ADDR_OFFSET, 4);
+        assert_eq!(sock::ADDR_OFFSET + 4 + 8, sock::SOCKADDR_IN_LEN);
     }
 }

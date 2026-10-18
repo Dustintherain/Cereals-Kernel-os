@@ -10,6 +10,9 @@
   v0.9 范围内的目标已全部完成；剩余项（`mprotect`、完整动态链接（用户态 `ld.so`）、
   TCP/ICMP 与 socket、更多用户程序）归 v1.0，其中 **`mprotect` 已于 2026-10-11（v1.0 第一步）落地**：
   已映射页的保护属性可在运行期改写（`PROT_NONE` 与 W^X 的「先写后换只执行」，见 syscall.md 3.10）；
+  **Socket/TCP 已于 2026-10-14（v1.0 第三步）落地**：内核 TCP 客户端最小集 + `socket`/`bind`/`connect`/`sendto`/`recvfrom`
+ （号 41/42/44/45/49）+ `/bin/tcpecho` 回显往返，`make test-network` 13 → **23 项**（见 syscall.md 3.13）；
+  ICMP（ping）仍待落地；
   **v1.0 之后新增「桌面环境兼容路线」（规划）**：
   D0 地基 → D1 输入 → D2 显示 → D3 音频 → D4 会话/电源 → D5 收尾，见 [desktop.md](desktop.md)；
   同日再加 **「纯内核化改造规划」（v0.9 之后，规划；执行上在桌面路线之前）**：边界收敛 ——
@@ -77,7 +80,7 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | **v0.7 🟡** | VFS + RAMFS + ELF（2026-10-11 核心已验收：`FileSystem` trait + 挂载表最长前缀路由 + RAMFS 后端 + fd 表 + `open/read/write/close` + **ELF Loader**（RAMFS `/init` 按段权限逐页装载，`RW` 段对 ring3 可写）；`make test-fs` 19 项 / `make test-user` 32 项 PASS）。Shell 里 `ls/cat/cd` 属 v0.9、磁盘 FS（FAT32）与 `mkfs` 属 v0.8 | filesystem.md / syscall.md |
 | **v0.8 ✅** | Driver + PCI + Disk（2026-10-11 验收：驱动注册框架 + PCI 枚举 + 块设备 + **legacy virtio-blk**（`make test-driver` 22 项）；**FAT12/16/32 只读后端挂到 VFS** + H-03 `mkfs`（`make test-fat` 21 项），双盘启动读 `/disk`（启动盘）与 `/mnt/fat`（测试盘）） | drivers.md / filesystem.md |
 | **v0.9 ✅** | Shell + User Programs + Network（**六步全部落地**：第一步 **用户堆**（`brk`/`mmap`/`munmap` + `libc` 全局分配器）；第二步 **`stdin` + 交互式 Shell**（键盘行缓冲 → `read(0)` 整行 → `/bin/sh`）；第三步 **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`** —— Shell 的外部程序 `/bin/hello` 真的能跑起来（`make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-user` 61 项）；第四步 **简化网络栈**（virtio-net + Ethernet/ARP/IPv4/UDP，`make test-network` 13 项）；第五步 **基础用户程序**（`ls`/`cat`/`echo`/`ps` → `/bin/*`，含新增的目录枚举 `getdents` 与进程表 `getprocs`，`make test-programs` 17 项 + 5 正则）；第六步 **内核侧最小动态链接**（`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`，`/bin/dynhello` + `/lib/{ld.so,libgreet.so}`，`make test-dyn` 10 项 + `make dyn-hostcheck` glibc 独立复核）。**仍不做（归 v1.0）：`mprotect`、完整动态链接（用户态 `ld.so`）、TCP/ICMP 与 socket、更多用户程序**） | syscall.md / process.md / drivers.md / filesystem.md |
-| **v1.0** | 完整可启动的类 Linux 小型 OS（第一步 ✅ 2026-10-11：**`mprotect`**） | syscall.md |
+| **v1.0** | 完整可启动的类 Linux 小型 OS（第一步 ✅ 2026-10-11：**`mprotect`**；第二步 ✅ 2026-10-14：**驱动兼容性 —— AHCI/SATA 驱动 + PCI 枚举修缺陷 B-18**，`make test-ahci` 24 项，见 drivers.md 1.9；第三步 ✅ 2026-10-14：**Socket/TCP 补齐** —— 内核 TCP 客户端最小集 + 五个 socket 系调用 + `/bin/tcpecho`，`make test-network` 13 → **23 项**，见 syscall.md 3.13） | syscall.md / drivers.md |
 
 > **v1.0 之后（规划，执行上排在桌面路线之前）**：CKM（内核级权限与扩展管理）——
 > CKM Core（`kernel/src/ckm/`：强制权限、组件状态、审计）→ CKM Service（`ckmd`：事务/包操作/修复）
@@ -115,7 +118,10 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
    `RELATIVE`/`JUMP_SLOT`，见 syscall.md 3.9）于 2026-10-11 落地 —— v0.9 至此收官。
 8. **第八阶段（v1.0，进行中）**：整合、安全机制、发布 —— 第一步 **`mprotect`**（内存保护属性运行期改写）
    已于 2026-10-11 落地并验收（`make test-user` 91 项，见 syscall.md 3.10 与 DEVELOPMENT.md 5.7）；
-   用户/组/权限、完整启动链、发布准备仍待做。
+   第二步 **AHCI/SATA 驱动 + B-18** 已于 2026-10-14 落地（`make test-ahci` 24 项，见 drivers.md 1.9）；
+   第三步 **Socket/TCP 补齐** 已于 2026-10-14 落地（`make test-network` 13 → **23 项**，
+   `make test-user` 91 → **96 项**，见 syscall.md 3.13）；ICMP（ping）、用户/组/权限、
+   完整启动链、发布准备仍待做。
 9. **第九阶段（v1.0 之后，规划）**：桌面环境兼容 —— 内核侧地基与接口对齐（D0–D5），见 [desktop.md](desktop.md)。
 10. **第十阶段（v0.9 之后，进行中；执行上排在第九阶段之前）**：纯内核化边界收敛 —— 内核只提供机制，
     用户态已拆到独立 workspace `userland/`（阶段二/三/四 ✅、阶段五 🟡；阶段一/六 未做）；

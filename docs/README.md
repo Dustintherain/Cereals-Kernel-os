@@ -26,9 +26,9 @@
 | [software-development.md](./software-development.md) | **软件开发文档**：环境与工具链、构建/测试/调试、代码与文档规范、协作流程、质量门禁、扩展步骤 | 🟡 持续更新（2026-10-11 新建） |
 | [boot.md](./boot.md) | 阶段：Bootloader / UEFI / Kernel Entry / GDT / IDT | ✅ v0.1 + v0.2 已完成 |
 | [memory.md](./memory.md) | 阶段：物理/虚拟内存 / Heap / Allocator | ✅ v0.3 已完成 |
-| [drivers.md](./drivers.md) | 阶段：驱动框架 / PCI / 磁盘（含 v0.4 中断/时钟/键盘/上下文切换） | ✅ v0.8 已完成（驱动注册框架 + PCI 枚举 + 块设备抽象 + **legacy virtio-blk**，`make test-driver` 22 项 PASS；启动盘已改为 virtio-blk）；v0.4（PIC + PIT 100Hz + PS/2 键盘 + 上下文切换原语）已完成；v0.9 键盘加**行缓冲 + 终端式回显**（`make test-keyboard` 断言同步）；**v0.9 第四步：简化网络栈（virtio-net + Ethernet → ARP → IPv4 → UDP）已落地**（`make test-network` 13 项，见 1.8） |
+| [drivers.md](./drivers.md) | 阶段：驱动框架 / PCI / 磁盘（含 v0.4 中断/时钟/键盘/上下文切换） | ✅ v0.8 已完成（驱动注册框架 + PCI 枚举 + 块设备抽象 + **legacy virtio-blk**，`make test-driver` 23 项 PASS；启动盘已改为 virtio-blk）；**v1.0 驱动兼容性：AHCI/SATA 驱动已落地**（`make test-ahci` 24 项 PASS，见 1.9；并修 PCI 枚举缺陷 B-18）；v0.4（PIC + PIT 100Hz + PS/2 键盘 + 上下文切换原语）已完成；v0.9 键盘加**行缓冲 + 终端式回显**（`make test-keyboard` 断言同步）；**v0.9 第四步：简化网络栈（virtio-net + Ethernet → ARP → IPv4 → UDP）已落地**（`make test-network` 13 项，见 1.8）；**v1.0 TCP/socket 补齐**（内核 TCP 客户端最小集 + `socket`/`bind`/`connect`/`sendto`/`recvfrom` + `/bin/tcpecho`，`make test-network` 13 → **23 项**，见 1.10） |
 | [process.md](./process.md) | 阶段：进程/线程 / 上下文切换 / 调度器 / IPC | ✅ v0.5 已完成（线程模型 + 上下文切换 + Round Robin 时间片调度 `make test-scheduler`；IPC pipe 骨架 `make test-ipc`）；channel / shared_memory 仍为占位；v0.6 追加了 `scheduler::suspend()`；**v0.9 第三步：进程对象与 `fork`/`execve`/`wait4` 已落地**（每进程地址空间 + 每进程 64 KiB 内核栈 + 完整用户帧，`make test-proc`，见 1.4） |
-| [syscall.md](./syscall.md) | 阶段：系统调用 / 用户空间 / ELF | 🟡 v0.7 核心已完成（`syscall`/`sysret` 入口 + ring3 隔离 + `read/write/open/close`+ `write/exit/getpid/sleep` + **ELF Loader** 从 RAMFS `/init` 按段权限装载），v0.9 已落地六步：**用户堆**（3.5）、**`stdin` + 交互式 Shell**（3.6）、**`fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序 `/bin/hello` 真的能跑）、**基础用户程序 + `getdents`/`getprocs`**（3.8，`/bin/{ls,cat,echo,ps}`）、**内核侧最小动态链接**（3.9，`ET_DYN` + `PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`，`/bin/dynhello` + `/lib/*`）；**v1.0 第一步：`mprotect`**（3.10，已映射页的保护属性运行期改写 + `PROT_NONE`，W^X 的「先写后换只执行」）；`make test-user` 91 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-programs` 17 项 + 5 正则 / `make test-dyn` 10 项 PASS；仍未做：环境变量/文件映射（`mmap` 加 offset）/**完整**动态链接（见 3.4/3.9/3.10） |
+| [syscall.md](./syscall.md) | 阶段：系统调用 / 用户空间 / ELF | 🟡 v0.7 核心已完成（`syscall`/`sysret` 入口 + ring3 隔离 + `read/write/open/close`+ `write/exit/getpid/sleep` + **ELF Loader** 从 RAMFS `/init` 按段权限装载），v0.9 已落地六步：**用户堆**（3.5）、**`stdin` + 交互式 Shell**（3.6）、**`fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序 `/bin/hello` 真的能跑）、**基础用户程序 + `getdents`/`getprocs`**（3.8，`/bin/{ls,cat,echo,ps}`）、**内核侧最小动态链接**（3.9，`ET_DYN` + `PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`，`/bin/dynhello` + `/lib/*`）；**v1.0 第一步：`mprotect`**（3.10，已映射页的保护属性运行期改写 + `PROT_NONE`，W^X 的「先写后换只执行」）；**v1.0 第三步：Socket/TCP 补齐**（3.13，`socket`/`bind`/`connect`/`sendto`/`recvfrom` 41/42/44/45/49 + `/bin/tcpecho`）；`make test-user` 96 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-programs` 33 项 + 7 正则 / `make test-dyn` 10 项 PASS；仍未做：环境变量/文件映射（`mmap` 加 offset）/**完整**动态链接（见 3.4/3.9/3.10） |
 | [filesystem.md](./filesystem.md) | 阶段：VFS / RAMFS / 磁盘文件系统 | ✅ v0.7 + **v0.8 磁盘后端**已完成（VFS trait + 挂载表最长前缀路由 + RAMFS + fd 表；**FAT12/16/32 只读后端** + `tools/mkfs/mkfs.py`，`make test-fs` 21 项 / `make test-fat` 21 项 PASS） |
 | [desktop.md](./desktop.md) | **桌面环境兼容路线（v1.0 之后，规划）**：现状审计、用户态/内核侧归属、D0–D5 分层里程碑与 QEMU 验收 | 📋 规划（2026-10-11 新增） |
 | [pure-kernel.md](./pure-kernel.md) | **纯内核化改造规划与执行记录**：现状审计（C1–C9，含实测证据）、逐文件迁移清单、内核/用户态双仓库划分、六阶段（Cargo 配置 / 构建目标 / 验收）、七条验收标准对照、非目标 | 🟡 执行中（阶段二/三/四 ✅，2026-10-12 更新） |
@@ -42,8 +42,8 @@
 - **第五阶段（v0.5）**：进程/线程 + Round Robin 调度 + IPC（pipe 骨架）✅（见 process.md）。
 - **第六阶段（v0.6–v0.7）**🟡：v0.6（syscall 入口 + ring3 隔离 + 用户态脚手架）与
   v0.7（VFS/RAMFS/fd 表 + 文件 syscall + ELF Loader）均已实现并验收，见 syscall.md 与 filesystem.md。
-- **第七阶段（v0.8）**✅：驱动注册框架 + PCI 枚举 + 块设备（legacy virtio-blk）已实现并验收（`make test-driver` 22 项），
-  见 drivers.md；磁盘文件系统（**FAT12/16/32 只读后端**）已挂到现有 VFS，H-03 `mkfs` 同步落地（`make test-fat` 21 项），
+- **第七阶段（v0.8）**✅：驱动注册框架 + PCI 枚举 + 块设备（legacy virtio-blk）已实现并验收（`make test-driver` 23 项），
+  见 drivers.md；**v1.0 第二步再接上 AHCI/SATA 驱动**（真机磁盘控制器，`make test-ahci` 24 项，并修 PCI 枚举缺陷 B-18），磁盘文件系统（**FAT12/16/32 只读后端**）已挂到现有 VFS，H-03 `mkfs` 同步落地（`make test-fat` 21 项），
   见 filesystem.md。之后的 v0.9：Shell + 用户程序 + 网络。
 - **第八阶段（v0.9 开局）**🟡：第一步 **用户堆**（`brk`/`mmap`/`munmap` + `libc` 的
   `#[global_allocator]`）已落地并验收（见 syscall.md 3.5）；第二步 **`stdin` + 交互式 Shell**
@@ -51,12 +51,18 @@
   第三步 **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`** 已落地并验收 ——
   Shell 能真的跑起外部程序（`/bin/hello`，`make test-proc`，见 syscall.md 3.7 与 process.md 1.4）；
   第四步 **简化网络栈**（virtio-net + Ethernet → ARP → IPv4 → UDP，`make test-network` 13 项，见 drivers.md 1.8）已落地；
+  v1.0 **TCP/socket 补齐**（内核 TCP 客户端最小集 + 五个 socket 系调用 + `/bin/tcpecho` 回显往返，
+  `make test-network` 13 → **23 项**，见 drivers.md 1.10 与 syscall.md 3.13）已落地；
   第五步 **基础用户程序**（`ls`/`ps`/`cat`/`echo` → `/bin/*`，含新增的目录枚举 `getdents` 与进程表 `getprocs`，
-  `make test-programs` 17 项 + 5 正则，见 syscall.md 3.8）已落地；
+  `make test-programs` 33 项 + 7 正则，见 syscall.md 3.8）已落地；
   第六步 **内核侧最小动态链接**（`ET_DYN` + `PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`，
   `make test-dyn` 10 项 + `make dyn-hostcheck` 宿主 glibc 独立复核，见 syscall.md 3.9）已落地 —— ✅ 六步全部完成。
 - **v1.0 第一步**✅（2026-10-11）：**`mprotect`** —— 已映射页的保护属性可在运行期改写
   （`PROT_NONE` 关页不丢帧、`RX` 转换后真的执行，见 syscall.md 3.10；`make test-user` 91 项）；
+- **v1.0 第三步**✅（2026-10-14）：**Socket/TCP 补齐** —— 内核 TCP 客户端最小集
+  （三次握手/收发/关闭）+ `socket`/`bind`/`connect`/`sendto`/`recvfrom`（41/42/44/45/49）+
+  `/bin/tcpecho` 回显往返（见 syscall.md 3.13；`make test-network` 13 → **23 项**，
+  `make test-user` 91 → **96 项**）；ICMP（ping）仍待落地。
   **完整**动态链接（用户态 `ld.so`）、文件映射（`mmap` 加 offset）、用户/组/权限等仍归后续
   （见 architecture.md 第 5 节）。
 - **第九阶段（v1.0 之后）**📋：**桌面环境兼容**（内核侧地基与接口对齐，D0 地基 → D1 输入 →

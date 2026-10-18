@@ -5,8 +5,9 @@
 //! - [`address_space`]：用户页表（独立 PML4 + 按段权限逐页映射 + 内核 USER 位清理）；
 //! - [`elf`]：ELF64 装载器（RAMFS 上的 `/init` → 用户地址空间）；
 //! - [`syscall_table`]：编号 → handler 的分发表；
-//! - [`process`] / [`file`] / [`memory`] / [`dir`]：已实现的 syscall
-//!   （exit/getpid/sleep/getprocs、read/write/open/close、mmap/munmap/brk、getdents）；
+//! - [`process`] / [`file`] / [`memory`] / [`dir`] / [`net`]：已实现的 syscall
+//!   （exit/getpid/sleep/getprocs、read/write/open/close、mmap/munmap/brk、getdents、
+//!   socket/bind/connect/sendto/recvfrom）；
 //! - [`ckm`]：CKM 管理接口（CKM-1）—— `ckm_policy_query`(257) / `ckm_audit_read`(258)
 //!   / `ckm_component_state`(259)，判定点落点见 `docs/ckm.md` 3.4；
 //! - [`user`]：用户程序与 ring3 运行驱动 —— `/init`（`user/hello` 的 ELF，从 RAMFS 装载）
@@ -26,6 +27,7 @@ pub mod dynamic;
 pub mod elf;
 pub mod file;
 pub mod memory;
+pub mod net;
 pub mod process;
 pub mod storage;
 pub mod syscall_table;

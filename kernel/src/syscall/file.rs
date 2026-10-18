@@ -275,6 +275,10 @@ pub unsafe fn sys_read(args: &[u64; 5], space: *const UserSpace) -> i64 {
         log_errno("read", fd, vfs::EBADF);
         return vfs::EBADF;
     }
+    // 套接字 fd（独立号段）：`read` = `recv`（首段即返），见 `syscall::net`
+    if crate::network::socket::is_socket_fd(fd) {
+        return unsafe { crate::syscall::net::socket_read(fd, space, buf, count) };
+    }
 
     let dst = match unsafe { user_bytes_mut(space, buf, count, "read") } {
         Ok(dst) => dst,
@@ -303,6 +307,11 @@ pub unsafe fn sys_write(args: &[u64; 5], space: *const UserSpace) -> i64 {
     }
     if count == 0 {
         return 0;
+    }
+
+    // 套接字 fd（独立号段）：`write` = `send`（全发），见 `syscall::net`
+    if crate::network::socket::is_socket_fd(fd) {
+        return unsafe { crate::syscall::net::socket_write(fd, space, buf, count) };
     }
 
     let bytes = match unsafe { user_bytes(space, buf, count, "write") } {
@@ -399,6 +408,10 @@ pub unsafe fn sys_open(args: &[u64; 5], space: *const UserSpace) -> i64 {
 /// 系统调用 `close(fd)`：释放 fd 槽位。
 pub unsafe fn sys_close(args: &[u64; 5], _space: *const UserSpace) -> i64 {
     let fd = args[0] as i32;
+    // 套接字 fd（独立号段）：先 FIN 关闭再释放槽位，见 `syscall::net`
+    if crate::network::socket::is_socket_fd(fd) {
+        return crate::syscall::net::socket_close(fd);
+    }
     match fdtable::close(fd) {
         Ok(()) => {
             serial::print("user: close fd=");

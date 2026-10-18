@@ -10,9 +10,13 @@
   **内核侧最小动态链接**（3.9：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）；
   **v1.0 第一步已落地**：`mprotect`（3.10：已映射页的保护属性可在运行期改写，`PROT_NONE`
   与 W^X 的「先写后换只执行」因此成立）；
-  `make test-user` 91 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 条正则 /
-  `make test-programs` 17 项 + 5 条正则 / `make test-dyn` 10 项 / `make test-fs` 21 项 PASS；
-  仍未做：环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`，见 3.9）、文件映射（`mmap` 加 offset）
+  `make test-user` 96 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 条正则 /
+  `make test-programs` 33 项 + 7 条正则 / `make test-dyn` 10 项 / `make test-fs` 21 项 PASS；
+  **socket/TCP（3.13）**：`socket`/`bind`/`connect`/`sendto`/`recvfrom`
+  （Linux 号 41/42/44/45/49）+ 内核 TCP 客户端最小集 + `/bin/tcpecho` 两轮回声收发，
+  `make test-network` 23 项 PASS（见 drivers.md 1.8）；
+  仍未做：环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`，见 3.9）、文件映射（`mmap` 加 offset）、
+  TCP 服务端（`listen`/`accept`）、UDP 套接字、ICMP
 - **阶段三（2026-10-12）**：调用号 / `errno` / 标志位 / 记录布局的**权威定义已移入 `abi/` crate**
   （单一事实源）：本文档的号段表与各记录布局由它校对，内核与 `libc` 都引用同一处；
   防漂移命令是 `make abi-check`（序号/号段/记录尺寸/能力位固化）+ `abi/src/record.rs`
@@ -36,7 +40,11 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
    **内核侧最小动态链接**（见 3.9：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）。
 7. **v1.0 第一步（已做）**：`mprotect`（见 3.10）—— 已映射页的保护属性可在运行期改写，
    `PROT_NONE` 与 W^X 的「先 `mmap(RW)` 写、再 `mprotect(RX)` 执行」因此成立。
-8. **仍未做**：环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`）、文件映射（`mmap` 加 offset）。
+8. **socket/TCP（已做，见 3.13）**：`socket`/`bind`/`connect`/`sendto`/`recvfrom`
+   （Linux 号 41/42/44/45/49）+ 内核 TCP 客户端最小集（三次握手/按序收发/FIN 关闭）+
+   `/bin/tcpecho`（`sendto`/`recvfrom` 与 `write`/`read` 两轮回声收发）。
+9. **仍未做**：环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`）、文件映射（`mmap` 加 offset）、
+   TCP 服务端（`listen`/`accept`）、UDP 套接字、ICMP。
 
 ## 2. v0.6 实际实现（2026-10-10 落地）
 
@@ -122,10 +130,10 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 
 | syscall | 号 | 状态 | 行为 |
 | ---- | ---- | ---- | ---- |
-| `read` | 0 | ✅ v0.7 / v0.9 | fd 0 → **键盘行缓冲整行交付**（v0.9：行尾统一 `\n`；3 秒无整行 → `-EAGAIN`，见 3.6）；fd ≥ 3 → 从 VFS 读入用户缓冲（要求**可写**，否则 `-EFAULT`）；偏移量随之推进，EOF 返回 0 |
-| `write` | 1 | ✅ v0.6/v0.7 | `fd=1/2` 写串口；`fd ≥ 3` 写文件（VFS，偏移量随之推进）；缓冲要求可读 |
+| `read` | 0 | ✅ v0.7 / v0.9 / TCP 补齐 | fd 0 → **键盘行缓冲整行交付**（v0.9：行尾统一 `\n`；3 秒无整行 → `-EAGAIN`，见 3.6）；fd ≥ 3 → 从 VFS 读入用户缓冲（要求**可写**，否则 `-EFAULT`）；偏移量随之推进，EOF 返回 0；**套接字 fd（≥ 16）→ `recv`（首段即返），见 3.13** |
+| `write` | 1 | ✅ v0.6/v0.7 / TCP 补齐 | `fd=1/2` 写串口；`fd ≥ 3` 写文件（VFS，偏移量随之推进）；缓冲要求可读；**套接字 fd（≥ 16）→ `send`（全发），见 3.13** |
 | `open` | 2 | ✅ v0.7 | `open(path_ptr, path_len, flags)`：路径用**指针 + 长度**（内核已校验区间，不在不可信内存上找 NUL）；`flags` 只接受 `O_RDONLY`/`O_WRONLY`/`O_RDWR`/`O_CREAT`，返回**最小空闲 fd**（≥3） |
-| `close` | 3 | ✅ v0.7 | 释放动态 fd（0/1/2 是保留位，关闭它们返回 `-EBADF`） |
+| `close` | 3 | ✅ v0.7 / TCP 补齐 | 释放动态 fd（0/1/2 是保留位，关闭它们返回 `-EBADF`）；**套接字 fd 先 FIN 关闭再释放槽位（握手失败也释放），见 3.13** |
 | `sleep`（nanosleep） | 35 | ✅ v0.6 | 以 PIT tick（10ms）为单位等待；期间 `sti; hlt` 让 PIT 继续推进 |
 | `getpid` | 39 | ✅ v0.6 | 返回当前用户程序 PID（串口打印 `user: getpid -> N`） |
 | `exit` | 60 | ✅ v0.6 | 记录退出码并结束用户态执行（不返回） |
@@ -134,6 +142,7 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 | `brk` | 12 | ✅ v0.9 第一步 | 增长/收缩堆顶（窗口 256 KiB）；`addr = 0` 只查询；**Linux 语义：不返回错误**，失败返回原值（`ret < addr` 即失败）；增长全成或全不成 |
 | `fork` / `execve` / `wait4` | 57 / 59 / 61 | ✅ v0.9 第三步 | `fork` 复制地址空间与当前用户帧（子进程 `rax=0`、父进程得 PID）；`execve(path, argv)` 换映像并重建 argv 用户栈（**成功不返回**）；`wait4(pid)` 运行并回收直接子进程、返回退出码（非子进程 `-ECHILD`）；详见 3.7 |
 | `mprotect` | 10 | ✅ v1.0 第一步 | 改写**已映射**页的保护属性（页对齐、`len > 0`、范围不跨窗口、每页已映射，缺一即 `-EINVAL`）；`PROT_WRITE\|PROT_EXEC` 仍拒绝（W^X）；`PROT_NONE` 清 `USER` 位而保留 `PRESENT`（帧与内容都在，可改回来）；用户栈固定 `RW`+`NX`，不在支持范围 —— 详见 3.10 |
+| `socket` / `bind` / `connect` / `sendto` / `recvfrom` | 41 / 49 / 42 / 44 / 45 | ✅ TCP 补齐 | 只认 `AF_INET` + `SOCK_STREAM` + `IPPROTO_TCP`（其余 `-EAFNOSUPPORT`）；地址是 16 字节 `sockaddr_in`（`addr_len != 16` 即 `-EINVAL`）；套接字 fd 独立号段（16..=23）；`sendto`/`recvfrom` 只收 `NULL` 地址（已连接字节流）；详见 3.13 |
 
 分发表按 `SYS_MAX`(=267) 排满：未实现的号落在公共 ENOSYS 桩，
 「号合法但未实现」与「号越界」是两种可区分的失败路径。
@@ -141,6 +150,8 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 `257..=260` 由 CKM 提案预留、`261..=266` 由 CSS 使用（已实现 **261 `storage_volumes`**、
 **262 `storage_mount`**、**263 `storage_unmount`**、**264 `storage_assign_letter`**、**265 `storage_rescan`**；
 只有 **266 `storage_format`** 仍落 ENOSYS 桩 —— 它要 CSS-4 才定义，见 3.11/3.12）。
+Linux 号段另有 **socket 系 41/42/44/45/49**（`socket`/`connect`/`sendto`/`recvfrom`/`bind`，
+见 3.13；`listen`/`accept` 等服务端号仍为 ENOSYS 桩，连名字都未发布）。
 
 文件 syscall 的两条硬规则（v0.7 新增）：
 
@@ -339,7 +350,7 @@ user/hello (Rust + libc)
 
 ### 3.3 验收（v0.7，实测）
 
-`make test-user`（v0.7 时 32 项；v0.9 第一步增至 59 项、第三步起 61 项、v1.0 第一步起 **91 项**，见 3.5/3.10）与 `make test-fs`（**21 项**）
+`make test-user`（v0.7 时 32 项；v0.9 第一步增至 59 项、第三步起 61 项、v1.0 第一步起 91 项、TCP 补齐后 **96 项**，见 3.5/3.10/3.13）与 `make test-fs`（**21 项**）
 串口断言全部 PASS，关键证据：
 
 - [x] **ELF 从文件装载**：`fs: create /init` → `user: program=/init source=elf bytes=15596 segments=4
@@ -546,8 +557,8 @@ Linux `task_struct.comm` 的形状）—— `create` 用调试名填充，`execv
       （v0.7 起 `list()` 只有内核自测用过）；`ls: entry name=bin kind=dir size=0` 证明元数据也被读出来了；
       （`/` 在第五步时是 4 条，3.9 又加了 `/lib` → 5 条，CKM-2 又加了内核的 `/ckm`（覆盖区）→ **6** 条；
       `fs: ls / entries=5` 那条是内核自测的窗口，在 `/ckm` 建立之前，因此不变）
-- [x] `ls: /bin entries=8`：`/bin` 里恰好是这次构建写进去的 8 个程序
-      （`sh`/`hello`/`ls`/`cat`/`echo`/`ps`/`dynhello`/`volumes`，后两个见 3.9 与 3.11）—— 同时证明 `fs::init` 的程序清单是完整的；
+- [x] `ls: /bin entries=9`：`/bin` 里恰好是这次构建写进去的 9 个程序
+      （`sh`/`hello`/`ls`/`cat`/`echo`/`ps`/`dynhello`/`volumes`/`tcpecho`，后三个见 3.9、3.11 与 3.12）—— 同时证明 `fs::init` 的程序清单是完整的；
 - [x] `user: getprocs count=2` + `ps: pid=3 ppid=0 state=RUNNING comm=sh` + `ps: pid=N ppid=3 … comm=ps`：
       `ps` 读的是**内核进程表**：表里恰好是 Shell 与 `ps` 自己，`ppid` 指回 Shell（`fork` 建出的父子关系）；
 - [x] `user: exec pid=N path=/bin/{ls,ps,echo} segments=4 image_pages=5 entry=0x8000000000`（`/bin/cat` 为 **6 页**）：
@@ -712,6 +723,41 @@ CSS-3（见 [storage.md](./storage.md) 第 4/9 节）把 262/263/264 从 ENOSYS 
   - [x] 权限：`/bin/hello`（uid 2000）三次存储受控动作均 `-1` + `ckm: policy op=storage_mount … need=0x10`
         （判定点 8 的拒绝三件套）。
 
+### 3.13 Socket 与 TCP（2026-10-14 落地）
+
+v0.9 的网络只到 UDP（`network/{tcp,socket}.rs` 是占位，见 drivers.md 1.8）；
+这里补的是 **socket 可用的最小 TCP** —— 用户态 `socket` 系调用 + 内核 TCP 客户端最小集
+（三次握手/按序收发/FIN 关闭，见 drivers.md 1.8 的 wire 部分）。号沿用 Linux x86_64：
+
+| syscall | 号 | 签名 | 失败语义 |
+| ---- | ---- | ---- | ---- |
+| `socket(domain, ty, protocol)` | **41** | 只认 `AF_INET`(2) + `SOCK_STREAM`(1) + `IPPROTO_TCP`(6)/0 | 其余组合 `-EAFNOSUPPORT`；表满（8 个）`-ENOSPC` |
+| `bind(fd, addr_ptr, 16)` | **49** | `sockaddr_in`，地址只接受全 0（bind-any），端口非 0 | `addr_len != 16` / 端口 0 / 端口被占 / 重复 bind → `-EINVAL` |
+| `connect(fd, addr_ptr, 16)` | **42** | 三次握手，阻塞到建立或失败；未 `bind` 时从临时段自动分配端口 | 对端 RST → `-ECONNREFUSED`；重传耗尽 → `-ETIMEDOUT` |
+| `sendto(fd, buf, len, 0, 0)` | **44** | 已连接套接字上全发（按 MSS 切块、每块等累积 ACK） | 未连接 `-ENOTCONN`；带地址 `-EINVAL`；对端已 FIN 还要发 `-EIO` |
+| `recvfrom(fd, buf, len, 0, 0)` | **45** | 首段即返（`0` = 对端有序关闭）；地址回填未实现，传 0 | 未连接 `-ENOTCONN`；带地址 `-EINVAL`；超时 `-ETIMEDOUT` |
+
+- 地址布局的权威定义在 `abi::sock`（16 字节：family LE + port BE + addr + 补 0），
+  `libc::sockaddr_in` 是调用侧构造器；新增 errno（`abi::errno`，Linux 取值）：
+  `-EAFNOSUPPORT`(97)/`-ENOTCONN`(107)/`-ETIMEDOUT`(110)/`-ECONNREFUSED`(111)；
+- fd 号段：套接字 16..=23（`SOCK_FD_BASE`，`network::socket` 表），文件 0..=15 ——
+  `read`/`write`/`close` 按号段分发到同一套后端（`read` = `recv` 首段即返，
+  `write` = `send` 全发，`close` 先 FIN 关闭再释放槽位）；
+- **用户态**：`libc` 新增 `socket`/`bind`/`connect`/`sendto`/`recvfrom` + `sockaddr_in` 构造器
+  （`lib.rs` re-export），新增 `/bin/tcpecho`（`user/tcpecho`）：`connect(10.0.2.2:18080)` 后做
+  **两轮**收发 —— 第一轮 `sendto`/`recvfrom`，第二轮 `write`/`read`（同一连接，
+  覆盖 fd 路由），逐字节比对，成功 `tcpecho: PASS` + `exit(0)`；
+- 内核自测（`syscall/user.rs`）：有网卡时跑 `/bin/tcpecho` 并要求 `exit(0)`
+  （`user: tcpecho PASS`），无网卡时 `user: tcpecho SKIP`（不是失败）；
+  套接字表随 `fs::file::reset` 一起在每次进入用户态前清空（全局表模型，见 `network/socket.rs`）；
+- 验收（`make test-network` 13 → **23 项**，编排 `network` 场景同步）：
+  `net: tcp connect 10.0.2.2:18080 ESTABLISHED` → `send len=12 acked` →
+  `recv len=12 match=PASS` → `close FIN-ACK PASS` → `tcp PASS`（内核自测），
+  再 `tcpecho: round 1 sendto/recvfrom PASS` / `round 2 write/read PASS` / `tcpecho: PASS` /
+  `user: tcpecho PASS`（用户态两条 syscall 路径）；
+- 明确不做（见 drivers.md 1.8）：服务端（`listen`/`accept`）、UDP 套接字、ICMP、
+  窗口通告与流控（恒 65535）、SACK/时间戳/窗口扩大、乱序重组、RTO 估算。
+
 ## 4. 调用链示例
 
 实际调用链（v0.7 + v0.9 用户堆 / 动态链接 + v1.0 `mprotect`）：
@@ -768,4 +814,5 @@ fd ≥ 3 一律经 VFS 抽象路由，syscall 层不认识具体后端。
 | 2026-10-11 | **v1.0 第一步：`mprotect`（运行时改保护属性）** —— 新增 3.10；`syscall/memory.rs` 新增 `sys_mprotect`（页对齐/`len>0`/未知位/`W^X` 四类 ABI 拒绝，每类留一行 `user: mprotect rejected (<reason>)`）+ `mmap(PROT_NONE)` 由拒绝改为合法；`address_space.rs` 新增 `mprotect`（范围须在同一窗口、每页已映射，否则 `-EINVAL`；`PROT_NONE` = 清 `USER` 留 `PRESENT`）、`UserWindow`、`prot_to_flags`、`accessible`（`PRESENT`+`USER` 齐备才算可访问）与 `set_page_flags`（改权限即 `invlpg`），堆窗口新增逐页 `heap_flags`（`brk` 增长/收缩与 `fork` 同步，`page_flags` 据此判断堆页）；`syscall_table` 注册 10 号、`UNIMPLEMENTED` 因此**空表**（`mod.rs` 的打印注释同步）；`libc` 新增 `mprotect`/`PROT_NONE`（`lib.rs` re-export）；`user/hello` 新增 `mprotect_selftest`（`PROT_NONE` → 内核拒收 `-EFAULT` → 内容原样 → `RX` 后真的执行机器码 → 6 个负例 → `munmap` 照常归还）；`make test-user` 61 → **91 项** PASS（含 brk 堆窗口的 `PROT_NONE` 往返）；头部状态与 2.7 表、1、3.4/3.5 的「未做」清单同步 |
 | 2026-10-11 | **CSS-1：存储枚举（261 `storage_volumes` / 265 `storage_rescan`）** —— 新增 3.11；`syscall/storage.rs` 实现两个号（定长 64 字节卷记录、确定性枚举、`storage_volumes` 无需能力位、`rescan` 设备不存在 `-ENODEV`）；`syscall_table.rs` 的 `SYS_MAX` 257 → **267**，并在 CKM 预留的 257–260 之后开出 CSS 号段 261–266（261/265 已实现，262/263/264/266 落 `UNIMPLEMENTED` 桩，串口可区分「未实现」与「号越界」）；`libc` 新增 `storage_volumes`/`storage_rescan` + `volume_*` 解析器，新增用户程序 `user/volumes` → `/bin/volumes`；头部号段表、1 节分发表说明、3.4 与 3.10 的「空表」表述同步 |
 | 2026-10-12 | **阶段三：系统调用 ABI 的单一事实源（`abi/` crate）** —— 新增 `abi/`（`no_std`、零依赖、`forbid(unsafe_code)`）：`syscall.rs`（号 + `SYS_MAX` + 号段规则 + `NAMED`/`UNIMPLEMENTED`）、`errno.rs`、`flags.rs`（`O_*`/`PROT_*`/`MAP_*`/fd 编号）、`limits.rs`（`PATH_MAX`/`IO_MAX`/`ARG_*`）、`dirent.rs`/`procinfo.rs`/`volume.rs`/`ckm.rs`（记录布局、能力位、op 编号、受保护前缀）与 `record.rs`（编译期断言）；内核 18 个文件（`syscall/*` 9 + `fs/file.rs` + `security/capability.rs` + `ckm/{mod,audit,state,policy}.rs` + `storage/volume.rs` 等）与 `libc/src/syscall.rs` 的 45 个常量改为引用它（**对外名字与类型不变**，行为零变化）；新增 `make abi-check` 并入 `make check`。相关段落（3.8 的解析偏移、3.11 的记录布局）已改为指向 `abi` |
+| 2026-10-14 | **Socket/TCP 补齐（41/42/44/45/49 + 内核 TCP 客户端最小集 + `/bin/tcpecho`）** —— 新增 3.13；`abi/` 新增 `sock.rs`（`AF_INET`/`SOCK_STREAM`/`IPPROTO_TCP` + `sockaddr_in` 布局）与 `NAMED` 26 → **31**（`SYS_MAX` 不变，号落在 Linux 段内），`errno.rs` 新增 `-EAFNOSUPPORT`(97)/`-ENOTCONN`(107)/`-ETIMEDOUT`(110)/`-ECONNREFUSED`(111)；`network/tcp.rs` 重写为真实实现（三次握手 + 按 MSS 切块发送 + 累积 ACK + 重传 + 按序接收 + RST/FIN + `echo` 验收函数），`network/socket.rs` 重写为套接字表（fd 16..=23，`create`/`bind`/`connect`/`send`/`recv`/`close`），`network/arp.rs` 新增无缓存 `resolve` 自由函数（`Stack::arp_resolve` 改为调它，只留缓存查/填）；新增 `syscall/net.rs`（五个 handler + `read`/`write`/`close` 的套接字 fd 路由），`syscall_table.rs` 注册五号，`syscall/file.rs` 按号段分发，`syscall/user.rs` 有网卡时跑 `/bin/tcpecho`（`REQUIRED_PROGRAM_PATHS` 8 → 9，无网卡 `SKIP`）；`libc` 新增封装 + `sockaddr_in` 构造器（`lib.rs` re-export），新增 `user/tcpecho`（manifest/清单 8 → 9，`/bin` 条目数 8 → **9**）；`tests/test_boot.py` 新增 `--tcp-echo-port`（宿主回声服务），`make test-network` 13 → **23 项**，编排 `network` 场景同步；回归 `test-user`（96）/`test-programs`（33+7）/`test-driver`（23）/`test-fs`（21）/`check-boundary`/`go-test` 全 PASS；头部状态与 1、2.7、3.4 的计数同步 |
 | 2026-10-12 | **CSS-3：卷管理（262 `storage_mount` / 263 `storage_unmount` / 264 `storage_assign_letter`）** —— 新增 3.12；`syscall/storage.rs` 实现三个号（参数校验先于能力判定；对应 `fs::mount_volume_by_id`/`fs::unmount_point` 与 `storage::registry::assign_letter`）；`libc` 新增三个包装与 `path` 模块（`C:\x` → POSIX）、`/bin/volumes` 扩为 `list`/`mount`/`unmount`/`letter`/`demo`；头部号段表改为「只余 266 `storage_format` 落 ENOSYS 桩」，3.10 的桩表描述同步；验收在 `make test-storage`（盘符断言）/`test-programs`（`volumes demo` 双入口）/`test-ckm`（零能力拒绝） |

@@ -142,7 +142,7 @@ fs: create /init
 fs: write /init bytes=29096
 fs: create /bin/sh
 fs: write /bin/sh bytes=29096
-...             （/bin/hello、/bin/ls、/bin/cat、/bin/echo、/bin/ps、/bin/dynhello 同形：create + write bytes=<ELF 大小>）
+...             （/bin/hello、/bin/ls、/bin/cat、/bin/echo、/bin/ps、/bin/volumes、/bin/tcpecho、/bin/dynhello 同形：create + write bytes=<ELF 大小>）
 fs: mkdir /lib
 fs: create /lib/ld.so
 fs: write /lib/ld.so bytes=<ELF 大小>
@@ -152,10 +152,10 @@ fs: mkdir /etc
 fs: create /etc/motd
 fs: write /etc/motd bytes=23
 fs: mkdir /tmp
-fs: ramfs files=12 bytes=<总计>    （init + 8 个程序 + motd + /lib 的 2 个对象；目录不计入文件数）
+fs: ramfs files=13 bytes=<总计>    （init + 9 个程序 + motd + /lib 的 2 个对象；目录不计入文件数）
 ```
 
-（ELF 字节数随构建变化，断言只写前缀；`files=12` 是**清单长度**的后果 —— 加一个程序/库就要同步
+（ELF 字节数随构建变化，断言只写前缀；`files=13` 是**清单长度**的后果 —— 加一个程序/库就要同步
 `syscall/user.rs::PROGRAM_IMAGES`/`LIBRARY_IMAGES`、`kernel/build.rs` 的构建清单与这里。）
 
 ### 2.6 fd 表与 syscall 对接
@@ -314,6 +314,7 @@ fs: disk selftest PASS
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-14 | **v1.0 第三步（Socket/TCP 补齐）影响**：RAMFS `/bin` 加 `tcpecho` → `fs: ramfs files` 12 → **13**（2.5 的树与启动日志同步；`make test-programs` 断言 `ls: entry name=tcpecho`）；`fs/` 与 syscall 文件层无改动（套接字 fd 走独立号段，不进 fd 表） |
 | 2026-10-12 | **CSS-3 影响**：`fs/mod.rs` 新增 `mount_volume_by_id`/`unmount_point`（`storage_mount`(262)/`storage_unmount`(263) 的底层落点，复用 CSS-2 的 `MountTable::mount_volume`/`alias_volume`/`umount`）；`fs/vfs.rs` 与已挂载后端的读写路径**无改动**（`C:\x` 是 `userland/libc/src/path.rs` 在发 syscall 前重写为 POSIX，内核仍只认绝对 POSIX 路径，见 storage.md 4.2） |
 | 2026-10-12 | **CKM-2 影响**：`fs::mount` 的 `resolve`/`route` 在查表之前接入覆盖层路径改写（`ckm::overlay`，空表为快路径），因此「路径 → 后端」的每一种入口都看到同一份视图；新增 `fs::overlay_selftest`（在 `fs/` 侧建立 `/ckm/overlay/**`、注册/撤销、断言 `open` 结果变化）→ 用户进程看到的 `/` 从 5 变 **6**（`ls: / entries=6`，而 `fs::selftest` 的 5 不变，它在 `/ckm` 建立之前）；启动盘 FAT 由 64 MiB 收为 **63 MiB**（尾部 1 MiB 是 CKM 状态区），`sectors=129024 clusters=64244`（`make test-fat` 与 `test-programs` 的 `bytes=66060288` 同步）；`fs/vfs.rs` 与 syscall 层无改动 |
 | 2026-10-11 | **CSS-2 落地（VFS 收口）**：`FileSystem` 增 `caps`/`volume_info`（保守缺省；RAMFS 可写、FAT 只读+大小写不敏感+卷标）；`fs/fat.rs` 增 FAT 探测唯一入口 `probe`/`probe_sector`/`bp_identity` 并把 `FatFs::open` 改返回 `OpenError { errno, reason }`；`fs/mount.rs` 拆「后端 / 挂载点」两张表（一个后端可被多挂载点引用），条目带 `vol_id`/`options`，新增 `alias_volume`/`umount`/`route`/`sync_counts`（挂载计数写回卷记录）；`fs::mount_disks` 按卷表挂载并保留 `/disk`、`/mnt/fat` 兼容点；`fs: stat` 行尾带 `vol=`；新增 `fs::storage_mount_selftest`（只读原因来自能力位、后端与记录一致、同一卷多挂载点同字节、卸载后 `ENOENT` 且卷仍在表、`ENOENT`/`EINVAL`/`EEXIST` 反例）；本文第 2.1/2.2/3.2/4 节同步标注现状 |

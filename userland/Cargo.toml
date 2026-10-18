@@ -19,6 +19,7 @@ members = [
     "user/echo",
     "user/ps",
     "user/volumes",
+    "user/tcpecho",
 ]
 
 # 用户程序专用 profile：相对 dev 有两处必须调整

@@ -27,7 +27,7 @@ KERNEL_ELF := target/x86_64-unknown-none/debug/kernel
 USERLAND        := userland
 USERLAND_IMAGES := $(BUILD)/userland/images
 
-.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image storage-images run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-ckm test-ckm-store test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network test-all user userland-images test-pkg test-all-with-userland abi-check go-test test-orch test-orch-userland check-boundary check clean
+.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image storage-images run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-ckm test-ckm-store test-driver test-ahci test-fat test-storage-fixtures test-storage test-storage-mbr test-network test-all user userland-images test-pkg test-all-with-userland abi-check go-test test-orch test-orch-userland check-boundary check clean
 
 help:
 	@echo "targets:"
@@ -50,6 +50,7 @@ help:
 	@echo "  test-ckm - v1.0: CKM-1 + CKM-2 — capability policy (EPERM vs EACCES) + audit ring + component state + overlay + persistent state area"
 	@echo "  test-ckm-store - CKM-2: write -> restart -> read back (dual-slot A/B state area on a private disk copy)"
 	@echo "  test-driver - v0.8: assert PCI enumeration + driver probe + virtio-blk sector read/write"
+	@echo "  test-ahci - v1.0: assert the AHCI/SATA driver on the chipset controller (00:1f.2) + block selftest on a SATA disk"
 	@echo "  fat-image - v0.8: build the FAT test volume (tools/mkfs/mkfs.py from tests/fatroot/data)"
 	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
 	@echo "  storage-images - CSS-1: build GPT/MBR fixtures (mkfs.py; ext4 payload from host mkfs.ext4)"
@@ -172,7 +173,7 @@ test-pagefault: image-pagefault
 
 # 全量回归：先跑主机侧边界门禁（内核不得依赖用户态），再跑全部 QEMU 场景 ——
 # 包含 test-kernel-only（没有用户态镜像时内核照样启动 + 进入可诊断状态）。
-test-all: abi-check check-boundary test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-scheduler test-ipc test-fs test-ckm-store test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network
+test-all: abi-check check-boundary test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-scheduler test-ipc test-fs test-ckm-store test-driver test-ahci test-fat test-storage-fixtures test-storage test-storage-mbr test-network
 
 # 交叉仓库：内核 test-all + 用户态集成测试（需要 userland/ 或 CERLESSE_USERLAND_DIR）。
 # 这些目标断言 `/init`/`/bin/*`/`libc` 的输出，因此**不属于内核 test-all**（见 docs/pure-kernel.md 阶段五）。
@@ -460,8 +461,10 @@ test-ckm-store: image fat-image
 #   - `vendor=0x1af4 device_id=0x1001`：QEMU 在 `disable-modern=on` 下暴露的 **legacy**
 #     virtio-blk（modern 是 0x1042，被驱动明确拒绝）；
 #   - `bar0=io:`：legacy 接口的标志 —— 寄存器在 **I/O 窗口** 里（modern 只有 MMIO）；
-#   - `probe PASS (devices=5 matched=1 attached=1 failed=0)`：枚举到了 5 个 function，
-#     其中恰好 1 个有驱动认领且挂接成功（没有驱动报错）；
+#   - `probe PASS (devices=7 matched=2 attached=2 failed=0)`：枚举到了 **7** 个 function
+#     （B-18 修好后 00:1f.2/00:1f.3 这两个「多功能设备的后继 function」才看得见），
+#     其中 2 个有驱动认领且挂接成功：virtio-blk 与 **ahci**（本场景没插 SATA 盘，
+#     所以 AHCI 那行的读数是 `drives=0` —— 有控制器、没盘是常态，不算失败）；
 #   - `capacity=131072 sectors (64 MiB)`：容量是设备报的，与 tools/image-builder 的镜像尺寸互相印证；
 #   - `boot sector sig=0x55aa fstype=FAT16`：从磁盘真的读回了本次构建的 FAT 引导扇区；
 #   - `chunked read PASS`：4608 字节的读跨过驱动内部 8 扇区搬运边界，与两次独立读逐字节一致；
@@ -483,7 +486,8 @@ test-driver: image
 		--expect "virtio-blk: registered as block device 0" \
 		--expect "driver: attached " \
 		--expect "driver: probe PASS (devices=" \
-		--expect "matched=1 attached=1 failed=0)" \
+		--expect "matched=2 attached=2 failed=0)" \
+		--expect "ahci: controller 00:1f.2 drives=0 failures=0" \
 		--expect "block: registered devices=1" \
 		--expect "block: device=virtio-blk0 sector_size=512 sectors=131072" \
 		--expect "block: boot sector sig=0x55aa fstype=FAT16" \
@@ -492,7 +496,56 @@ test-driver: image
 		--expect "block: negative cases PASS" \
 		--expect "block: selftest PASS"
 
-# v0.9 验收：简化网络栈（virtio-net → Ethernet → ARP → IPv4 → UDP）。
+# v1.0 驱动兼容性验收：AHCI/SATA —— **真实机器上的磁盘控制器**。
+#
+# q35 的芯片组本身就带一个 ICH9 AHCI 控制器（00:1f.2 / 8086:2922 /
+# class 0x01 subclass 0x06 prog_if 0x01），所以这里不加控制器，只把一块盘插到
+# 它的 2 号端口上（QEMU 里 q35 的 SATA 端口叫 ide.0..ide.5；2 号端口就是固件
+# 引导日志里那个 `Pci(0x1F,0x2)/Sata(0x2,...)`）。
+#
+# 断言的都是「第二条块设备路径」上的硬件事实，而不是日志措辞：
+#   - `pci: 00:1f.2 vendor=0x8086 device_id=0x2922 class=0x1 subclass=0x6 prog_if=0x1`：
+#     这是 00:1f.0（ISA 桥）的 **function 2**。修 B-18（头部类型读的是 0x0C —— cache
+#     line size，恒为 0 —— 而不是 0x0E）之前，多功能设备的 function 1..7 从来没被
+#     枚举过，内核「看不见」这台机器上唯一真实存在的磁盘控制器；
+#   - `ahci: port 2 det=3 sig=0x101 (SATA disk)` + `model=QEMU HARDDISK capacity=...`：
+#     型号与容量来自 IDENTIFY DEVICE（0xEC）的返回，即设备本身，不是常量；
+#   - `block: device=ahci0 ...` 起的一整套 `block::selftest`：与 virtio-blk **同一套**
+#     断言（引导扇区 / 跨 4 KiB 搬运边界的分块读 / 末扇区写回读后还原 / 负例）——
+#     「SATA 这条路也能读写」因此不是另写一份测试，而是同一批事实在另一条路径上成立；
+#   - `fs: mount point=/mnt/fat fs=fat32 ...` + `fs: disk selftest PASS`：同一张 FAT32
+#     镜像经 SATA 读出来挂进 VFS，文件内容按公式逐字节比对也成立。
+test-ahci: image fat-image
+	$(PYTHON) tests/test_boot.py \
+		--ahci \
+		--ahci-disk $(BUILD)/fat.img \
+		--serial-log $(BUILD)/serial-ahci.log \
+		--expect "Kernel started!" \
+		--expect "pci: 00:1f.2 vendor=0x8086 device_id=0x2922 class=0x1 subclass=0x6 prog_if=0x1" \
+		--expect "pci: 00:1f.2 bar5=mmio:" \
+		--expect "driver: registered index=2 name=ahci-pci" \
+		--expect "driver: match 00:1f.2 -> ahci-pci" \
+		--expect "ahci: controller 00:1f.2 abar=" \
+		--expect "ahci: version=0x10000" \
+		--expect "ahci: port 2 det=3 sig=0x101 (SATA disk)" \
+		--expect "ahci: port 2 model=QEMU HARDDISK capacity=131072 sectors (64 MiB) lba48=1" \
+		--expect "ahci: registered as block device 1 name=ahci0" \
+		--expect "ahci: controller 00:1f.2 drives=1 failures=0" \
+		--expect "driver: attached 00:1f.2 -> ahci-pci" \
+		--expect "driver: probe PASS (devices=7 matched=2 attached=2 failed=0)" \
+		--expect "block: registered devices=2" \
+		--expect "ahci: running the block selftest on the SATA disk (block index=1)" \
+		--expect "block: device=ahci0 sector_size=512 sectors=131072 bytes=67108864" \
+		--expect "block: boot sector sig=0x55aa fstype=FAT32 oem=CERLESSE" \
+		--expect "block: chunked read PASS" \
+		--expect "block: write/readback PASS (lba=131071 pattern=0xa5)" \
+		--expect "block: negative cases PASS" \
+		--expect "block: selftest PASS" \
+		--expect "storage: disk index=1 dev=ahci0 sectors=131072 table=none partitions=1" \
+		--expect "fs: mount point=/mnt/fat fs=fat32 sectors=131072" \
+		--expect "fs: disk selftest PASS"
+
+# v0.9 验收：简化网络栈（virtio-net → Ethernet → ARP → IPv4 → UDP）+ TCP/socket 补齐。
 #
 # QEMU 加一块 legacy virtio-net-pci（`-netdev user` = slirp），断言的是网络上
 # **回来的真实内容**而不是日志措辞：
@@ -501,10 +554,17 @@ test-driver: image
 #     往返，且 MAC 正是 slirp 网关的固定地址；
 #   - `net: dhcp offer yiaddr=10.0.2.15 ...`：DHCP DISCOVER（UDP 68→67 广播）→
 #     OFFER（UDP 67→68）往返，报文里的 yiaddr / server-id / mask / router 都被解析出来
-#     —— 这是 Ethernet → IPv4 → UDP 收发两条路径都通了的证据。
+#     —— 这是 Ethernet → IPv4 → UDP 收发两条路径都通了的证据；
+#   - `net: tcp ... ESTABLISHED` + `send/recv/close`：内核经三次握手连上宿主回声服务
+#     （`--tcp-echo-port` 在测试侧起，QEMU 把客户机对 10.0.2.2:18080 的连接转给它），
+#     发 12 字节、逐字节收回比对、FIN 完整关闭 —— TCP 是「真握手 + 真字节」；
+#   - `tcpecho: PASS` + `user: tcpecho PASS`：`/bin/tcpecho` 走用户态 socket syscall
+#     （`socket/connect/sendto/recvfrom` + `write/read` 两轮）与同一回声服务收发成功 ——
+#     syscall 路径与内核自测是同一套 TCP 代码（`network::tcp`），两条证据互相印证。
 test-network: image
 	$(PYTHON) tests/test_boot.py \
 		--nic \
+		--tcp-echo-port 18080 \
 		--serial-log $(BUILD)/serial-network.log \
 		--expect "Kernel started!" \
 		--expect "pci: enumerated devices=" \
@@ -518,7 +578,17 @@ test-network: image
 		--expect "net: arp PASS" \
 		--expect "net: dhcp offer yiaddr=10.0.2.15" \
 		--expect "net: dhcp PASS" \
-		--expect "net: selftest PASS"
+		--expect "net: tcp connect 10.0.2.2:18080 ESTABLISHED" \
+		--expect "net: tcp send len=12 acked" \
+		--expect "net: tcp recv len=12 match=PASS" \
+		--expect "net: tcp close FIN-ACK PASS" \
+		--expect "net: tcp PASS" \
+		--expect "net: selftest PASS" \
+		--expect "tcpecho: connected 10.0.2.2:18080" \
+		--expect "tcpecho: round 1 sendto/recvfrom PASS" \
+		--expect "tcpecho: round 2 write/read PASS" \
+		--expect "tcpecho: PASS" \
+		--expect "user: tcpecho PASS"
 
 # v0.8 H-03 验收：用 tools/mkfs/mkfs.py 生成「带已知文件集」的 FAT32 测试盘（64 MiB）。
 #
@@ -843,8 +913,8 @@ test-proc: image
 #     根目录是 6 项而不是 5：CKM-2 起内核多建了一个 `/ckm`（覆盖区 `/ckm/overlay`
 #     的家，`docs/ckm.md` 6.1）；`fs: ls / entries=5` 那条是 `fs::selftest`
 #     的窗口（在 `/ckm` 建立**之前**），两者不矛盾，分别在断自己的时点；
-#   - `ls: /bin entries=8`：`/bin` 里恰好是这次构建写进去的 8 个程序
-#     （sh / hello / ls / cat / echo / ps / volumes / dynhello）—— 同时证明 `fs::init` 的清单是完整的；
+#   - `ls: /bin entries=9`：`/bin` 里恰好是这次构建写进去的 9 个程序
+#     （sh / hello / ls / cat / echo / ps / volumes / dynhello / tcpecho）—— 同时证明 `fs::init` 的清单是完整的；
 #   - `user: storage_volumes count=1 total=1` + `volumes: fs:… disk=0 part=0 fs=fat16 …`：
 #     `volumes` 读的是**内核卷表**（CSS-1 新增的 `storage_volumes`，号 261）；单盘启动
 #     恰好 1 个卷（启动盘的 ESP），且 libc 按 64 字节记录解析出的字段与内核一致 ——
@@ -889,7 +959,8 @@ test-programs: image
 		--expect "ls: entry name=init kind=file size=" \
 		--expect "ls: entry name=bin kind=dir size=0" \
 		--expect "ls: entry name=ckm kind=dir size=0" \
-		--expect "ls: /bin entries=8" \
+		--expect "ls: /bin entries=9" \
+		--expect "ls: entry name=tcpecho kind=file size=" \
 		--expect "ls: entry name=ls kind=file size=" \
 		--expect "ls: entry name=volumes kind=file size=" \
 		--expect "user: getprocs count=2" \

@@ -49,6 +49,7 @@ L /lib/ld.so    ld.so               # L = 被装载对象（解释器 / 共享�
 | `user/hello-bin/` | 外部程序（`/bin/hello`）：由 Shell `fork` + `execve` 起来，打印 PID 与 `argv` |
 | `user/{ls,cat,echo,ps}/` | coreutils：`getdents` / 文件 syscall / `write` / `getprocs` |
 | `user/volumes/` | 存储卷枚举（`/bin/volumes`）：`storage_volumes`（CSS-1），打印卷表（`id`/`disk`/`part`/`fs`/`label`/`health`/`mounts`） |
+| `user/tcpecho/` | TCP 回显验收（`/bin/tcpecho`）：`connect` 连宿主回声服务，两轮往返分别走 `sendto`/`recvfrom` 与 `write`/`read`（v1.0 socket/TCP 补齐） |
 | `user/dynhello/` | 动态链接夹具（`as`+`ld` 现编）：`dynhello` + `libgreet.so` + `ld.so` |
 | `user/init/` | v0.9 占位（2 行）；真正的 `/init` 是 `user/hello` 的产物 |
 | `tools/check_dyn_fixture.py` | 动态链接夹具结构自检（ET_DYN + `PT_INTERP` + `DT_NEEDED`） |
@@ -58,7 +59,7 @@ L /lib/ld.so    ld.so               # L = 被装载对象（解释器 / 共享�
 ## 3. 构建
 
 ```bash
-make -C userland images        # 构建 8 个程序（+3 个动态链接对象）+ manifest.txt
+make -C userland images        # 构建 9 个程序（+3 个动态链接对象）+ manifest.txt
 make -C userland check         # 同上，并逐个校验 ELF 段布局（基址/页对齐/W^X/窗口/无重定位）
 make -C userland dyn           # 只重编动态链接夹具（需要 binutils：as/ld）
 make -C userland dyn-hostcheck # 用宿主机 glibc 的 ld.so 复核同一批夹具（缺工具则跳过）
@@ -76,7 +77,7 @@ make -C userland clean
 
 ```bash
 make image            # 先出用户态镜像，再编内核（按清单内嵌），最后组装磁盘镜像
-make test-user        # 91 项：ELF 装载 / ring3 syscall / 用户堆 / mprotect / 隔离 / Shell
+make test-user        # 96 项：ELF 装载 / ring3 syscall / 用户堆 / mprotect / 隔离 / Shell
 make test-shell test-proc test-programs test-dyn
 make test-pkg         # 转发到 userland/pkgmgr（.ckc 容器 + cpm 事务引擎）
 make test-orch-userland  # 只跑标记 userland 的编排场景
@@ -86,10 +87,10 @@ make test-orch-userland  # 只跑标记 userland 的编排场景
 
 | 目标 | 用户态侧证据 |
 | ---- | ---- |
-| `make test-user`（91 项） | `/init` 从 RAMFS 装载、`exit(42)`、用户堆、`mprotect`（`PROT_NONE`/`RX` 转换 + 真的执行机器码）、页帧回收、隔离探针 |
+| `make test-user`（96 项） | `/init` 从 RAMFS 装载、`exit(42)`、用户堆、`mprotect`（`PROT_NONE`/`RX` 转换 + 真的执行机器码）、页帧回收、隔离探针 |
 | `make test-shell`（11 项） | 键盘 → 行缓冲 → `/bin/sh` → 内建命令 |
 | `make test-proc`（8 项 + 4 正则） | `fork`/`execve`/`wait4` + `argv`（`/bin/hello`、`ENOENT` → 127） |
-| `make test-programs`（17 项 + 5 正则） | `/bin/{ls,cat,echo,ps}` 真的被 exec 起来 |
+| `make test-programs`（33 项 + 7 正则） | `/bin/{ls,cat,echo,ps,volumes}` 真的被 exec 起来（`/bin/tcpecho` 的目录项一并断言） |
 | `make test-dyn`（10 项） | `PT_INTERP` + `libgreet.so` + `RELATIVE`/`JUMP_SLOT` |
 | `make test-kernel-only`（7 项） | **反向**证据：没有用户态镜像时内核照样启动并进入诊断模式 |
 
@@ -97,6 +98,7 @@ make test-orch-userland  # 只跑标记 userland 的编排场景
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-14 | **v1.0 Socket/TCP 补齐**：`libc` 新增 `socket`/`connect`/`bind`/`sendto`/`recvfrom` 封装 + `AF_INET`/`SOCK_STREAM`/`IPPROTO_TCP`/`SOCKADDR_IN_LEN` + `sockaddr_in` 构造器（`lib.rs` re-export）；新增 `user/tcpecho`（`/bin/tcpecho`，两轮回显分别走 `sendto`/`recvfrom` 与 `write`/`read`）；`make images` 构建 8 → **9 个程序**（manifest/清单同步） |
 | 2026-10-12 | **阶段五补充**：`userland/pkgmgr/`（`ckc.py` + `cpm.py` + 两份套件 + `README.md`，从内核仓库 `tools/pkgmgr/` 与 `tests/` 迁入）与 `userland/tools/check_user_elf.py`（从 `tools/` 迁入）落位；新增 `make -C userland test-pkg`/`test-all` —— 用户态侧**不需要内核源码**即可构建与测试 |
 | 2026-10-11 | 创建本 workspace：`libc/` 与 `user/` 从内核仓库根移入（保留 git 历史），独立 `Cargo.toml`（含 `user-release` profile）与 `.cargo/config.toml`（`code-model=large` 只对用户态生效）；构建入口 `Makefile`（`images`/`check`/`dyn`/`dyn-hostcheck`）产出 `build/userland/images/manifest.txt`；动态链接夹具与 `dyn-hostcheck` 从内核仓库搬来；新增 `tools/check_dyn_fixture.py` |
 | 2026-10-11 | **v1.0 第一步：`mprotect`** —— `libc` 新增 `mprotect`/`PROT_NONE`（`lib.rs` re-export，`syscall.rs` 文档同步）；`user/hello` 新增 `mprotect_selftest`（`PROT_NONE` → 内核拒收该缓冲 `-EFAULT` → 改回 `RW` 内容原样 → 换 `RX` 后真的执行 `mov eax,42; ret`，另覆盖 brk 堆窗口与 6 类拒绝）；`make test-user` 61 → **91 项** |

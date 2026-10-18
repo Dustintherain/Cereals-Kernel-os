@@ -37,7 +37,8 @@ pub trait Driver {
     fn attach(&self, dev: &PciDevice) -> Result<(), &'static str>;
 }
 
-/// 驱动数量上限（v0.8 virtio-blk；v0.9 追加 virtio-net。固定容量数组让借用关系一眼看清）。
+/// 驱动数量上限（v0.8 virtio-blk；v0.9 追加 virtio-net；v1.0 追加 ahci。
+/// 固定容量数组让借用关系一眼看清）。
 pub const MAX_DRIVERS: usize = 4;
 
 /// 驱动注册表（`register` 只在启动阶段写一次，之后只读）。
@@ -97,13 +98,15 @@ impl ProbeStats {
     }
 }
 
-/// 注册所有内置驱动（v0.8：virtio-blk；v0.9：virtio-net）。
+/// 注册所有内置驱动（v0.8：virtio-blk；v0.9：virtio-net；v1.0：ahci）。
 ///
-/// 注册顺序即匹配顺序：blk 在前、net 在后；两者匹配的厂商/设备 ID 不重叠
-///（legacy blk = `0x1001`，legacy net = `0x1000`），所以顺序不影响结果。
+/// 注册顺序即匹配顺序：blk 在前、net 其次、ahci 最后；三者匹配的判据不重叠
+///（legacy blk = 厂商 `0x1af4` / 设备 `0x1001`；legacy net = 同厂商 / `0x1000`；
+/// ahci 只看类别 `0x01`/`0x06`/`0x01`），所以顺序不影响结果。
 pub fn register_builtin() -> Result<(), &'static str> {
     register(&crate::driver::virtio_blk::VIRTIO_BLK_DRIVER)?;
     register(&crate::driver::virtio_net::VIRTIO_NET_DRIVER)?;
+    register(&crate::driver::ahci::AHCI_DRIVER)?;
     Ok(())
 }
 

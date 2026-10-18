@@ -1,0 +1,12 @@
+[package]
+name = "user-tcpecho"
+version = "0.1.0"
+edition = "2021"
+description = "TCP/socket 用户态验收程序（/bin/tcpecho）：connect 回声服务并做两轮收发"
+
+[dependencies]
+libc = { path = "../../libc" }
+
+[[bin]]
+name = "user-tcpecho"
+path = "src/main.rs"

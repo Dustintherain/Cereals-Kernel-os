@@ -2,7 +2,8 @@
 //!
 //! 编号沿用 **Linux x86_64** 语义（便于以后直接跑现成的用户态程序）：
 //! `read=0, write=1, open=2, close=3, mmap=9, mprotect=10, munmap=11, brk=12,
-//! nanosleep=35, getpid=39, fork=57, execve=59, exit=60, wait4=61`，
+//! nanosleep=35, getpid=39, socket=41, connect=42, sendto=44, recvfrom=45, bind=49,
+//! fork=57, execve=59, exit=60, wait4=61`，
 //! 目录列举沿用 Linux 的 `getdents=78`（**记录格式不同**，见 [`crate::dirent`]）。
 //!
 //! **号段规则（阶段六冻结，现已生效）**：
@@ -50,6 +51,16 @@ pub const SYS_EXIT: u64 = 60;
 pub const SYS_WAIT: u64 = 61;
 /// `getdents(path_ptr, path_len, buf_ptr, buf_len)`（Linux 同名号，记录格式见 [`crate::dirent`]）。
 pub const SYS_GETDENTS: u64 = 78;
+/// `socket(domain, ty, protocol)`（Linux x86_64 号；只认 `AF_INET` + `SOCK_STREAM` + `IPPROTO_TCP`）。
+pub const SYS_SOCKET: u64 = 41;
+/// `connect(fd, addr_ptr, addr_len)`（Linux 号；`addr` 是 16 字节 `sockaddr_in`，见 [`crate::sock`]）。
+pub const SYS_CONNECT: u64 = 42;
+/// `sendto(fd, buf_ptr, len, addr_ptr, addr_len)`（Linux 号；已连接套接字上传 `0, 0` 地址）。
+pub const SYS_SENDTO: u64 = 44;
+/// `recvfrom(fd, buf_ptr, len, 0, 0)`（Linux 号；地址回填未实现，`addr` 必须传 0）。
+pub const SYS_RECVFROM: u64 = 45;
+/// `bind(fd, addr_ptr, addr_len)`（Linux 号；只固定本地端口，地址须是本机）。
+pub const SYS_BIND: u64 = 49;
 /// `getprocs(buf_ptr, buf_len)`（**Cerlesse 扩展号**：Linux 没有「列举进程」的系统调用，
 /// `ps` 走 `/proc`，而本内核的 VFS 还没有虚拟文件）。
 pub const SYS_GETPROCS: u64 = 256;
@@ -99,7 +110,7 @@ pub const fn is_cerlesse_segment(nr: u64) -> bool {
 /// 所有**有名字**的调用号（按号升序；[`crate::record`] 与自测用它断言唯一性）。
 ///
 /// 这张表是「已发布的号」清单：加号时同时加到这里，测试会拦住重复与越界。
-pub const NAMED: [u64; 26] = [
+pub const NAMED: [u64; 31] = [
     SYS_READ,
     SYS_WRITE,
     SYS_OPEN,
@@ -110,6 +121,11 @@ pub const NAMED: [u64; 26] = [
     SYS_BRK,
     SYS_SLEEP,
     SYS_GETPID,
+    SYS_SOCKET,
+    SYS_CONNECT,
+    SYS_SENDTO,
+    SYS_RECVFROM,
+    SYS_BIND,
     SYS_FORK,
     SYS_EXEC,
     SYS_EXIT,

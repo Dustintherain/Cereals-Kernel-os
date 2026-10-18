@@ -509,7 +509,7 @@ libc 45 常量）与两处刻意偏离见 8.2。
 | 3 | `rm -rf build/userland/images && make -C userland test-all`（images + check + dyn-hostcheck + test-pkg，`check_user_elf.py` 也已迁入） | ✅ 退出码 0 —— 用户态侧**不需要内核仓库的工具**就能构建与测试 |
 | 4 | `go vet ./... && go test ./...`（含新增 `cmd/testorch/main_test.go`：分组两个方向 + 未知标签拒绝） | ✅ 全部通过 |
 | 5 | `make test-orch` 命令（`-exclude-tag userland`，13 个内核场景） | ✅ 13/13 PASS（boot/memory/exception/pagefault/ckm-store/fs/driver/fat/storage/storage-mbr/keyboard/scheduler/network） |
-| 6 | `make test-all` 的 18 个内核目标逐个单跑 | ✅ 全 PASS（abi-check、check-boundary、test、test-kernel-only、test-exception、test-memory、test-pagefault、test-keyboard、test-scheduler、test-ipc、test-fs、test-ckm-store、test-driver、test-fat、test-storage-fixtures、test-storage、test-storage-mbr、test-network） |
+| 6 | `make test-all` 的 18 个内核目标逐个单跑 | ✅ 全 PASS（abi-check、check-boundary、test、test-kernel-only、test-exception、test-memory、test-pagefault、test-keyboard、test-scheduler、test-ipc、test-fs、test-ckm-store、test-driver、test-fat、test-storage-fixtures、test-storage、test-storage-mbr、test-network）；**v1.0 起 `test-all` 为 19 目标**（新增 `test-ahci`，见 [drivers.md](drivers.md) 1.9） |
 | 7 | `make test-all-with-userland` 的用户态那半（`test-user`/`test-shell`/`test-proc`/`test-programs`/`test-dyn`/`dyn-hostcheck`/`test-ckm`） | ✅ 全部 PASS（与上一轮相同命令；本轮只重跑了 `dyn-hostcheck` 与新到位置的 `test-pkg`） |
 
 **一项能力实测提醒**：本机内存 1983 MiB，`testorch -parallel 6` 会把 6 个 512 MiB 的 QEMU 顶爆（实测 `ckm-store` 的串口日志 0 字节、场景失败）；默认 `concurrency=2` 下

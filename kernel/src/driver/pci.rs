@@ -48,8 +48,11 @@ const CONFIG_DATA: u16 = 0x0CFC;
 
 /// PCI 配置空间里用到的偏移
 const OFFSET_VENDOR: u8 = 0x00;
+const OFFSET_COMMAND: u8 = 0x04; // command(16) | status(16)
 const OFFSET_CLASS: u8 = 0x08; // revision(8) | prog_if(8) | subclass(8) | class(8)
-const OFFSET_HEADER_TYPE: u8 = 0x0C;
+/// 头部类型：**0x0E**。`0x0C` 是 cache line size，读它恒为 0 → 多功能设备
+/// 的 function 1..7 永远不会被探测（B-18）。
+const OFFSET_HEADER_TYPE: u8 = 0x0E;
 const OFFSET_BAR0: u8 = 0x10;
 /// BAR 槽位数（`0x10..0x28`）
 pub const BAR_COUNT: usize = 6;
@@ -59,6 +62,11 @@ const NO_DEVICE: u16 = 0xFFFF;
 
 /// `header_type` 的 `MULTI_FUNCTION` 位
 const HEADER_MULTI_FUNCTION: u8 = 0x80;
+
+/// 命令寄存器位：响应内存空间访问（MMIO BAR 必须先打开它）
+pub const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
+/// 命令寄存器位：总线主控（设备可以发起 DMA）
+pub const COMMAND_BUS_MASTER: u16 = 1 << 2;
 
 /// 一个 PCI function。
 #[derive(Clone, Copy, Debug)]
@@ -101,6 +109,34 @@ impl PciDevice {
         self.bars.get(index).copied().flatten()
     }
 
+    /// 读命令寄存器（低 16 位；高 16 位是只读的状态寄存器，不在这里返回）。
+    pub fn command(&self) -> u16 {
+        let (bus, device, function) = self.location();
+        // SAFETY: 端口 I/O 在 ring0 使用；这里只读配置空间。
+        (unsafe { config_read32(bus, device, function, OFFSET_COMMAND) } & 0xFFFF) as u16
+    }
+
+    /// 置位命令寄存器里的 `bits`，返回**旧值**。
+    ///
+    /// 为什么是「读改写」而不是写一个 16 位字：命令寄存器的高 16 位是状态寄存器，
+    /// 用 `write32` 回写整字时保留它，比再引一次 `config_write16` 更不容易踩到
+    /// 「写状态位」的边界（状态位本身是只读的，但保留原值最省心）。
+    pub fn enable_command(&self, bits: u16) -> u16 {
+        let (bus, device, function) = self.location();
+        // SAFETY: 同 `command`；写命令寄存器是允许的（规范定义的可写寄存器）。
+        let old = unsafe { config_read32(bus, device, function, OFFSET_COMMAND) };
+        let command = (old as u16) | bits;
+        unsafe {
+            config_write32(
+                bus,
+                device,
+                function,
+                OFFSET_COMMAND,
+                (old & 0xFFFF_0000) | command as u32,
+            )
+        };
+        (old & 0xFFFF) as u16
+    }
 }
 
 /// 一个已探测的 BAR 窗口。

@@ -31,11 +31,12 @@ use crate::syscall::address_space::UserSpace;
 #[allow(unused_imports)]
 pub use abi::syscall::{
     is_cerlesse_segment, is_linux_segment, unimplemented_name, CERLESSE_SEGMENT_START,
-    LINUX_SEGMENT_END, SYS_BRK, SYS_CKM_AUDIT_READ, SYS_CKM_COMPONENT_STATE,
-    SYS_CKM_POLICY_QUERY, SYS_CKM_POLICY_SET, SYS_CLOSE, SYS_EXEC, SYS_EXIT, SYS_FORK,
-    SYS_GETDENTS, SYS_GETPID, SYS_GETPROCS, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN,
-    SYS_READ, SYS_SLEEP, SYS_STORAGE_ASSIGN_LETTER, SYS_STORAGE_FORMAT, SYS_STORAGE_MOUNT,
-    SYS_STORAGE_RESCAN, SYS_STORAGE_UNMOUNT, SYS_STORAGE_VOLUMES, SYS_WAIT, SYS_WRITE, SYS_MAX,
+    LINUX_SEGMENT_END, SYS_BIND, SYS_BRK, SYS_CKM_AUDIT_READ, SYS_CKM_COMPONENT_STATE,
+    SYS_CKM_POLICY_QUERY, SYS_CKM_POLICY_SET, SYS_CLOSE, SYS_CONNECT, SYS_EXEC, SYS_EXIT,
+    SYS_FORK, SYS_GETDENTS, SYS_GETPID, SYS_GETPROCS, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP,
+    SYS_OPEN, SYS_READ, SYS_RECVFROM, SYS_SENDTO, SYS_SLEEP, SYS_SOCKET,
+    SYS_STORAGE_ASSIGN_LETTER, SYS_STORAGE_FORMAT, SYS_STORAGE_MOUNT, SYS_STORAGE_RESCAN,
+    SYS_STORAGE_UNMOUNT, SYS_STORAGE_VOLUMES, SYS_WAIT, SYS_WRITE, SYS_MAX,
 };
 
 /// 系统调用处理函数类型。`args[0..5]` = `rdi, rsi, rdx, r10, r8`。
@@ -75,6 +76,12 @@ pub const SYS_TABLE: [SyscallHandler; SYS_MAX as usize] = {
     table[SYS_EXEC as usize] = crate::syscall::process::sys_exec;
     table[SYS_WAIT as usize] = crate::syscall::process::sys_wait;
     // v0.9 第五步：用户态可枚举目录（`ls`）与进程表（`ps`）
+    // TCP/socket 补齐：AF_INET/SOCK_STREAM 套接字（后端见 network::socket）
+    table[SYS_SOCKET as usize] = crate::syscall::net::sys_socket;
+    table[SYS_BIND as usize] = crate::syscall::net::sys_bind;
+    table[SYS_CONNECT as usize] = crate::syscall::net::sys_connect;
+    table[SYS_SENDTO as usize] = crate::syscall::net::sys_sendto;
+    table[SYS_RECVFROM as usize] = crate::syscall::net::sys_recvfrom;
     table[SYS_GETDENTS as usize] = crate::syscall::dir::sys_getdents;
     table[SYS_GETPROCS as usize] = crate::syscall::process::sys_getprocs;
     // CKM-1：策略查询 / 审计读取 / 组件状态（260 落 UNIMPLEMENTED 桩）

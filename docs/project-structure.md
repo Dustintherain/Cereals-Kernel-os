@@ -38,10 +38,12 @@ Cerlesse/
 │   │   ├── driver/              # ✅ v0.8：driver（注册框架）/pci/block/virtio_blk + serial（v0.1）
 │   │   │                        #    ✅ v0.9：keyboard 加行缓冲与行编辑（v0.4 起为 IRQ1 回显）
 │   │   │                        #    ✅ v0.9 第四步：net（NetworkDevice 抽象）+ virtio_net（legacy 网卡驱动）
+│   │   │                        #    ✅ v1.0：ahci（AHCI/SATA 块驱动；pci 修 B-18：头部类型偏移 0x0E）
 │   │   ├── time/                # timer/clock
 │   │   ├── ipc/                 # pipe/channel/shared_memory
 │   │   ├── network/             # ✅ v0.9 第四步：ethernet/arp/ipv4/udp/dhcp + mod（Stack + selftest）
-│   │   │                        #    tcp/socket 仍为占位（完整 TCP/IP 是第一版非目标）
+│   │   │                        #    ✅ v1.0 第三步：tcp（三次握手/按 MSS 发送/累积 ACK/重传/按序接收/RST/FIN + echo 验收函数）
+│   │   │                        #    + socket（8 槽套接字表，fd 16..=23）；ICMP 仍为占位（完整 TCP/IP 是第一版非目标）
 │   │   ├── security/            # permission/credential/capability
 │   │   └── main.rs              # 内核入口（v0.1 ✅：_start + kernel_main）
 │   ├── link.ld                  # 链接脚本：装载到 32MiB（ADR-007）
@@ -60,6 +62,8 @@ Cerlesse/
 │       ├── shell/               # ✅ 交互式 Shell → /bin/sh（fork/execve/wait4 跑外部命令）
 │       ├── hello-bin/           # ✅ 外部程序 → /bin/hello（由 Shell fork+execve 起来）
 │       ├── ls/ cat/ echo/ ps/   # ✅ coreutils → /bin/*
+│       ├── volumes/             # ✅ 存储卷枚举 → /bin/volumes（CSS-1 storage_volumes）
+│       ├── tcpecho/             # ✅ TCP 回显验收 → /bin/tcpecho（v1.0 第三步 socket/TCP 补齐）
 │       ├── dynhello/            # ✅ 汇编夹具（as+ld 现编）→ /bin/dynhello + /lib/{ld.so,libgreet.so}
 │       └── init/                # v0.9 占位（内核实际跑的 /init 是 user/hello 的产物）
 │
@@ -97,8 +101,8 @@ Cerlesse/
 | `kernel/src/scheduler/` | 调度队列、Round Robin | v0.5 |
 | `kernel/src/syscall/` | 系统调用入口/分发、用户地址空间、ELF Loader、首批与文件 syscall、**用户堆（`memory.rs`：`brk`/`mmap`/`munmap`）**、**进程调用（`process.rs`：`fork`/`execve`/`wait4` + argv 用户栈 + `getprocs`）**、**目录枚举（`dir.rs`：`getdents`）**、**最小动态链接（`dynamic.rs`：`ET_DYN`/`PT_INTERP`/`DT_NEEDED`/重定位）** | v0.6–v0.7 ✅ / v0.9 第一·三·五·六步 ✅ |
 | `kernel/src/fs/` | VFS 抽象（trait + 路径工具）、挂载表路由、RAMFS、fd 表、**FAT12/16/32 只读后端**；**CSS-2 收口：后端能力位/卷信息、挂载表带卷身份与多挂载点、卸载、挂载错误改 errno** | v0.7 ✅ / v0.8 ✅ / CSS-2 ✅ |
-| `kernel/src/driver/` | 串口（v0.1）、键盘（v0.4）、**驱动注册框架 / PCI 枚举 / 块设备抽象 / virtio-blk**（v0.8 ✅） | v0.4 / v0.8 |
-| `kernel/src/driver/{pci,driver,block,virtio_blk}.rs` | `pci` 只回答「总线上有什么」；`driver` 回答「谁来管它」（`Driver` trait + `probe_all`）；`block` 是上层唯一可见的按扇区接口；`virtio_blk` 是具体实现（同时实现 `Driver` 与 `BlockDevice`） | v0.8 ✅ |
+| `kernel/src/driver/` | 串口（v0.1）、键盘（v0.4）、**驱动注册框架 / PCI 枚举 / 块设备抽象 / virtio-blk**（v0.8 ✅）、virtio-net（v0.9 ✅）、**ahci（AHCI/SATA，v1.0 ✅）** | v0.4 – v1.0 |
+| `kernel/src/driver/{pci,driver,block,virtio_blk,ahci}.rs` | `pci` 只回答「总线上有什么」（含命令寄存器；v1.0 修 B-18：头部类型偏移 `0x0E`）；`driver` 回答「谁来管它」（`Driver` trait + `probe_all`）；`block` 是上层唯一可见的按扇区接口；`virtio_blk`/`ahci` 是两个具体实现（各自同时实现 `Driver` 与 `BlockDevice`，上层零改动） | v0.8 / v1.0 ✅ |
 | `kernel/src/fs/fat.rs` | 块设备上的 FAT12/16/32 **只读**后端（第二个 `FileSystem` 实现）：BPB 解析、固定根目录区/簇链目录、8.3 + NT 标志 + LFN、任意偏移读；写操作 `EROFS`；损坏结构 `EUCLEAN`；**CSS-2 起同时是 FAT 的探测唯一入口（`probe`/`probe_sector`）与 `caps`/`volume_info` 的提供方，`open` 返回 `OpenError{errno,reason}`** | v0.8 ✅ / CSS-2 ✅ |
 | `kernel/src/memory/frame.rs` | 位图帧分配器；v0.8 追加 `allocate_contiguous` / `free_contiguous`（virtqueue 与 DMA 要求的物理连续缓冲） | v0.3 ✅ / v0.8 ✅ |
 | `kernel/src/arch/x86_64/port.rs` | 端口 I/O 统一入口：`inb/inw/inl` + `outb/outw/outl`（PCI 配置空间与 legacy virtio 寄存器窗口依赖 32 位读写） | v0.8 ✅ |
@@ -106,8 +110,8 @@ Cerlesse/
 | `kernel/src/network/` | 以太网 → IP → TCP/UDP → Socket | v0.9 |
 | `kernel/src/security/` | 权限、凭证（uid/gid）、文件 mode 判定；**能力位与 CKM 判定点见 `kernel/src/ckm/`**（规划） | v1.0 |
 | `userland/` | **用户态独立 workspace**（不属于内核）：`libc/`（运行时）+ `user/*`（程序）+ `Makefile`（构建 + ELF 校验 + `manifest.txt`）+ `.cargo/config.toml`（large 代码模型只对用户态生效）；含 `pkgmgr/`（包管理器主机工具，阶段五迁入）与 `tools/`（`check_dyn_fixture.py`、`check_user_elf.py`）；与内核的唯一接触面是 `build/userland/images/` | 纯内核化 ✅ |
-| `userland/libc/` | 最小用户态运行时：syscall 封装（含 `open/read/close`、`brk/mmap/munmap` 与 `fork/execve/wait4`）、`_start`（入口寄存器 `argc`/`argv`）、`print!/println!`、panic handler、`heap`（`#[global_allocator]`）、`args` | v0.6 ✅ / v0.7 ✅ / v0.9 ✅ |
-| `userland/user/` | 用户程序（`hello` ✅ v0.6/v0.7 → `/init`；`shell` ✅ v0.9 → `/bin/sh`；`hello-bin` ✅ v0.9 第三步 → `/bin/hello`（外部程序）；**`ls` / `cat` / `echo` / `ps` ✅ v0.9 第五步 → `/bin/*`**；**`dynhello/` ✅ v0.9 第六步 —— 不是 Rust crate，而是 `as`+`ld` 现编的动态链接夹具 → `/bin/dynhello` + `/lib/{ld.so,libgreet.so}`**；`init/` 仍为占位） | v0.6–v0.9 |
+| `userland/libc/` | 最小用户态运行时：syscall 封装（含 `open/read/close`、`brk/mmap/munmap`、`fork/execve/wait4` 与 `socket/connect/bind/sendto/recvfrom` + `sockaddr_in`（v1.0 第三步））、`_start`（入口寄存器 `argc`/`argv`）、`print!/println!`、panic handler、`heap`（`#[global_allocator]`）、`args` | v0.6 ✅ / v0.7 ✅ / v0.9 ✅ |
+| `userland/user/` | 用户程序（`hello` ✅ v0.6/v0.7 → `/init`；`shell` ✅ v0.9 → `/bin/sh`；`hello-bin` ✅ v0.9 第三步 → `/bin/hello`（外部程序）；**`ls` / `cat` / `echo` / `ps` ✅ v0.9 第五步 → `/bin/*`**；`volumes` ✅ CSS-1 → `/bin/volumes`；`tcpecho` ✅ v1.0 第三步 → `/bin/tcpecho`；**`dynhello/` ✅ v0.9 第六步 —— 不是 Rust crate，而是 `as`+`ld` 现编的动态链接夹具 → `/bin/dynhello` + `/lib/{ld.so,libgreet.so}`**；`init/` 仍为占位） | v0.6–v0.9 |
 | `tools/`（Python） | 镜像构建、**`check-boundary.py`（内核/用户态边界门禁，纯内核化 ✅）**、`mkfs/` FAT 镜像生成（v0.8 ✅）；归属用户态的 `check_user_elf.py` 与 `pkgmgr/` 已于**阶段五**迁入 `userland/` | v0.1 起 / 阶段五 ✅ |
 | `tools-go/`（Go） | 测试编排、串口日志服务 | v0.4 起 |
 | `tests/` | QEMU 集成测试 | v0.1 起 |
@@ -202,6 +206,7 @@ time,process,scheduler,fs,driver,network,ipc,security}`、`boot/`、`shared/` �
 | 2026-10-11 | 纯内核化规划：新增第 4 节（目标结构：内核/用户态双仓库、新增 `abi/`、9 个内核文件改动清单）；修订记录顺延为第 5 节 |
 | 2026-10-11 | v1.0 之后规划：新增第 3 节（桌面路线预计新开的模块：`dev`/`procfs`/`sysfs`/`input`/`display`/`sound`/`acpi`/`ipc` 扩展 —— 均未创建，进入里程碑时回填） |
 | 2026-10-11 | v0.9 第六步（最小动态链接）：`kernel/src/syscall/dynamic.rs` 与 `address_space.rs` 的共享库窗口（基址 + 1 MiB、32 页）落地，`elf.rs` 按 `e_type` 分流；新增汇编夹具 `user/dynhello/`（`as`+`ld` 现编）与 RAMFS `/lib`，`kernel/build.rs` 的程序清单 7 → 8 —— 目录树、模块表与 `user/` 描述同步 |
+| 2026-10-14 | v1.0 第三步（Socket/TCP 补齐）：`kernel/src/network/tcp.rs` 从占位重写为真实实现（三次握手/按 MSS 切块发送/累积 ACK/重传/按序接收/RST/FIN + `echo` 验收函数），`socket.rs` 重写为 8 槽套接字表（fd 16..=23）；新增 `kernel/src/syscall/net.rs`（五个 handler）；`user/tcpecho` 从占位变为实现（RAMFS `/bin/tcpecho`）；`libc/` 新增 socket 系封装与地址构造器 —— 目录树、模块表同步 |
 | 2026-10-11 | v0.9 第五步（基础用户程序）：`kernel/src/syscall/dir.rs`（`getdents`）与 `process.rs::sys_getprocs` 落地；`user/{ls,cat,echo,ps}` 从占位变为实现（RAMFS `/bin/*`），`kernel/build.rs` 的程序清单 3 → 7；`libc/` 新增 `getdents`/`getprocs` 与 `dirent_*`/`procinfo_*` 解析器 —— 目录树、模块表与 `libc/` 描述同步 |
 | 2026-10-11 | v0.9 第三步（进程对象与外部程序）：`kernel/src/syscall/process.rs` 的 `fork`/`execve`/`wait4` 落地，`process/process.rs` 换成真正的 PCB（每进程内核栈），`trampoline` 改为按进程切换；`libc/` 新增 `args.rs`；新增 `user/hello-bin`（RAMFS `/bin/hello`）—— 目录树、模块表与 `libc/` 描述同步 |
 | 2026-10-11 | v0.9 第二步（交互式 Shell）：`user/shell` 从占位变为实现（首个 `/init` 之外的用户程序，RAMFS 上的 `/bin/sh`），`kernel/build.rs` 由「单个用户程序」改为「按列表构建/校验/内嵌」，`fs::init` 增加 `/bin`；`driver/keyboard.rs` 加行缓冲（目录树注释同步） |
@@ -213,6 +218,7 @@ time,process,scheduler,fs,driver,network,ipc,security}`、`boot/`、`shared/` �
 | 2026-10-11 | v0.6 用户态脚手架落地：`libc/` 与 `user/hello` 从占位变为实现并加入 workspace；`kernel/build.rs` 新增构建期用户程序构建与 ELF 摊平；workspace 新增 `user-release` profile 与 `default-members` |
 | 2026-10-11 | v0.7 落地：`kernel/src/fs/` 从占位变为实现（`vfs`/`inode`/`mount`/`ramfs`/`file`），`kernel/src/syscall/` 新增 `elf.rs` 与文件 syscall；`kernel/build.rs` 由「摊平内嵌」改为「校验 ELF 后原样内嵌」（RAMFS `/init`）；新增 `tools/check_user_elf.py`（`make user` 验段布局） |
 | 2026-10-11 | v0.8 前半落地：`kernel/src/driver/` 新增 `pci.rs` / `driver.rs` / `block.rs` / `virtio_blk.rs`（模块表里补上分层职责），`kernel/src/arch/x86_64/port.rs`（端口 I/O），`memory/frame.rs` 追加连续帧分配；`user/{init,shell,ls,...}` 仍为占位 |
+| 2026-10-14 | **v1.0 驱动兼容性**：`driver/` 新增 `ahci.rs`（AHCI/SATA 块驱动，第二条 `BlockDevice` 实现），`pci.rs` 修 B-18（头部类型偏移 `0x0C` → `0x0E`，多功能设备的 function 1..7 才被枚举）；新增 `make test-ahci`（并入 `test-all` → 19 目标）与编排场景 `ahci`（20 场景）；目录树与模块表同步 |
 | 2026-10-12 | **阶段五：构建与测试按责任拆分** —— `tools/pkgmgr/`（`ckc.py`+`cpm.py`）与 `tests/test_{ckc,cpm}.py` → `userland/pkgmgr/`，`tools/check_user_elf.py` → `userland/tools/`；`tests/orchestrate.json` 用 `tags` 分组 + `testorch -tag`/`-exclude-tag`；内核 `make test-all` 收敛为纯内核（18 目标），新增 `test-all-with-userland`/`test-orch-userland`，用户态侧 `make -C userland test-all`；目录树与模块表同步标注 |
 | 2026-10-11 | H-06 P0a：`tools/` 新增 `pkgmgr/ckc.py`（CKC 包容器，后缀 `.ckc`；**阶段五迁至 `userland/pkgmgr/`**）；目录树与模块表同步标注 |
 | 2026-10-11 | v0.9 第一步：`kernel/src/syscall/` 新增 `memory.rs`（用户堆 syscall），`libc/` 新增 `heap.rs`（`#[global_allocator]`）；目录树与模块表同步标注 |

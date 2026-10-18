@@ -36,3 +36,11 @@ pub const EINVAL: i64 = -22;
 pub const ENOSPC: i64 = -28;
 /// `-ENOSYS`：号合法但内核未实现（或号越界时的兜底返回）。
 pub const ENOSYS: i64 = -38;
+/// `-EAFNOSUPPORT`：不支持的地址族/类型/协议（socket 只认 `AF_INET` + `SOCK_STREAM` + TCP）。
+pub const EAFNOSUPPORT: i64 = -97;
+/// `-ENOTCONN`：套接字未连接（`send`/`recv` 之前必须先 `connect`）。
+pub const ENOTCONN: i64 = -107;
+/// `-ETIMEDOUT`：TCP 握手/收发超时（重传耗尽，对端无应答）。
+pub const ETIMEDOUT: i64 = -110;
+/// `-ECONNREFUSED`：对端 RST（端口未监听或连接被拒绝）。
+pub const ECONNREFUSED: i64 = -111;

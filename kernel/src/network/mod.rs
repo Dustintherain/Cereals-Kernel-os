@@ -6,8 +6,10 @@
 //! virtio-net → Ethernet II → ARP → IPv4 → UDP
 //! ```
 //!
-//! TCP / Socket 仍是占位（`docs/architecture.md` 第 5 节把「完整 TCP/IP」列为非目标；
-//! 见 [`tcp`] / [`socket`] 的说明）。本模块提供：
+//! [`tcp`] 是客户端最小集（三次握手 + 按序收发 + FIN 关闭；服务端/window/SACK 不做，
+//! `docs/architecture.md` 第 5 节的「完整 TCP/IP」仍是非目标）；
+//! [`socket`] 是 AF_INET/SOCK_STREAM 套接字表（用户态 `socket/connect/send/recv` 的后端，
+//! syscall 入口在 [`crate::syscall::net`]）。本模块提供：
 //!
 //! - [`ethernet`] / [`arp`] / [`ipv4`] / [`udp`] / [`dhcp`]：**纯函数**的组帧与解析；
 //! - [`Stack`]：把上面的纯函数接到一块 [`NetworkDevice`] 上，负责发送、轮询接收、
@@ -34,6 +36,16 @@ use crate::time::clock;
 pub const GUEST_IP: ipv4::Address = ipv4::Address::new(10, 0, 2, 15);
 /// QEMU `-netdev user`（slirp）默认的虚拟网关（= 虚拟主机 10.0.2.2）。
 pub const GATEWAY_IP: ipv4::Address = ipv4::Address::new(10, 0, 2, 2);
+/// TCP 回声服务的地址：slirp 把客户机对它的连接转给宿主的回声服务。
+///
+/// 与 [`GATEWAY_IP`] 同一地址（slirp 网关即宿主），端口与载荷见下。
+pub const TCP_ECHO_SERVER: ipv4::Address = GATEWAY_IP;
+/// TCP 回声服务的端口（测试侧在宿主 `0.0.0.0:18080` 起服务，见 `tests/test_boot.py`）。
+pub const TCP_ECHO_PORT: u16 = 18080;
+/// TCP 回声载荷（发出与期望收到的字节；短于 [`tcp::MSS`]，一次一段）。
+pub const TCP_ECHO_PAYLOAD: &[u8] = b"cerlesse-tcp";
+/// TCP 自测用的本机端口（临时端口段之外，测试断言不绑定它）。
+pub const TCP_LOCAL_PORT: u16 = 41000;
 
 /// ARP 解析的等待上限（PIT tick；100Hz → 100 tick = 1 秒）。
 const ARP_TIMEOUT_TICKS: u64 = 100;
@@ -73,11 +85,6 @@ impl<'a> Stack<'a> {
             arp_cache: arp::Cache::new(),
             next_id: 1,
         }
-    }
-
-    /// 发送一个已经拼好的以太网帧。
-    pub fn send_frame(&mut self, frame: &[u8]) -> Result<(), &'static str> {
-        self.dev.transmit(frame)
     }
 
     /// 在 `timeout_ticks` 内轮询一帧，收到就返回帧长。
@@ -131,58 +138,16 @@ impl<'a> Stack<'a> {
     }
 
     /// 解析 `target` 的 MAC：先查缓存，未命中就发 ARP 请求并等应答。
+    ///
+    /// 等待循环只有 [`arp::resolve`] 一份实现（TCP 连接与 socket 层复用它），
+    /// 这里只多做「查缓存 / 回填缓存」两件事。
     pub fn arp_resolve(&mut self, target: ipv4::Address) -> Option<[u8; 6]> {
         if let Some(mac) = self.arp_cache.lookup(target) {
             return Some(mac);
         }
-        let mut frame = [0u8; ethernet::HEADER_LEN + arp::PACKET_LEN];
-        let mut arp_bytes = [0u8; arp::PACKET_LEN];
-        arp::build(
-            &mut arp_bytes,
-            arp::OPER_REQUEST,
-            self.mac,
-            self.ip,
-            ethernet::ZERO_MAC,
-            target,
-        );
-        {
-            let payload =
-                ethernet::build(&mut frame, ethernet::BROADCAST_MAC, self.mac, ethernet::ETHERTYPE_ARP)?;
-            payload[..arp::PACKET_LEN].copy_from_slice(&arp_bytes);
-        }
-        self.send_frame(&frame).ok()?;
-
-        let mut rx = [0u8; net::FRAME_MAX];
-        let start = ticks();
-        loop {
-            let remaining = ARP_TIMEOUT_TICKS.saturating_sub(ticks().wrapping_sub(start));
-            let n = self.recv_frame(&mut rx, remaining)?;
-            let Some(eth) = ethernet::parse(&rx[..n]) else {
-                continue;
-            };
-            if eth.ethertype != ethernet::ETHERTYPE_ARP {
-                continue;
-            }
-            let Some(packet) = arp::parse(eth.payload) else {
-                continue;
-            };
-            if packet.oper != arp::OPER_REPLY || packet.sender_ip != target {
-                continue;
-            }
-            // 应答必须发给我们：以太网目的为本机（或广播），且 ARP 的目的 IP / MAC 都是本机。
-            if !(eth.dst == self.mac || ethernet::is_broadcast(eth.dst)) {
-                continue;
-            }
-            if packet.target_ip != self.ip || packet.target_mac != self.mac {
-                continue;
-            }
-            // 交叉校验：帧头源 MAC 应与 ARP 报文的发送方 MAC 一致（不一致只提示，以 ARP 为准）。
-            if eth.src != packet.sender_mac {
-                serial::println("net: arp note: frame src != arp sender mac");
-            }
-            self.arp_cache.insert(target, packet.sender_mac);
-            return Some(packet.sender_mac);
-        }
+        let mac = arp::resolve(&mut *self.dev, self.mac, self.ip, target, ARP_TIMEOUT_TICKS)?;
+        self.arp_cache.insert(target, mac);
+        Some(mac)
     }
 
     /// 发一个 DHCP DISCOVER 并等 OFFER，返回 offer 里给的地址。
@@ -229,10 +194,11 @@ impl<'a> Stack<'a> {
     }
 }
 
-/// v0.9 网络验收：ARP 解析网关 + DHCP DISCOVER → OFFER。
+/// 网络验收：ARP 解析网关 + DHCP DISCOVER → OFFER + TCP 回声往返。
 ///
 /// 断言的都是**网络上回来的真实内容**（不是日志措辞）：ARP 应答里的 MAC、
-/// OFFER 里的 `yiaddr` / server-id / 网关。任何一步没通，这里就会返回 `Err`。
+/// OFFER 里的 `yiaddr` / server-id / 网关、TCP 的 SYN-ACK 确认与回声字节。
+/// 任何一步没通，这里就会返回 `Err`（TCP 步需要测试侧的回声服务，见 [`TCP_ECHO_PORT`]）。
 pub fn selftest(dev: &mut dyn NetworkDevice) -> Result<(), &'static str> {
     let mut stack = Stack::new(dev);
 
@@ -276,6 +242,26 @@ pub fn selftest(dev: &mut dyn NetworkDevice) -> Result<(), &'static str> {
         return Err("net: DHCP OFFER carried a zero address");
     }
     serial::println("net: dhcp PASS");
+
+    // 3) TCP：对 slirp 后面的主机回声服务做一次 `connect → send → recv → close`
+    //    （`tcp::echo`）。回声服务由测试侧在宿主起（`tests/test_boot.py` 的
+    //    `--tcp-echo-port`），QEMU 把客户机对 `TCP_ECHO_SERVER:TCP_ECHO_PORT`
+    //    的连接转给它 —— 没有这个服务时这里按设计失败（不是跳过）：
+    //    `--nic` 的启动必须自带回声服务（`make test-network` 负责起）。
+    if let Err(err) = tcp::echo(
+        stack.dev,
+        stack.mac,
+        stack.ip,
+        &mut stack.next_id,
+        TCP_ECHO_SERVER,
+        TCP_ECHO_PORT,
+        TCP_ECHO_PAYLOAD,
+        TCP_LOCAL_PORT,
+    ) {
+        serial::print("net: tcp FAIL: ");
+        serial::println(err.name());
+        return Err("net: TCP echo round-trip failed");
+    }
 
     serial::println("net: selftest PASS");
     Ok(())

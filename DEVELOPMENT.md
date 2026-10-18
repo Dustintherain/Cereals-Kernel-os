@@ -9,7 +9,7 @@
   VFS（trait + 挂载表最长前缀路由）、RAMFS、fd 表、`read`/`write`/`open`/`close`，
   以及 **ELF Loader**（用户程序不再是摊平映像，而是 RAMFS 上的 `/init` 经 `elf.rs` 按段权限装载，
   `RW` 段对 ring3 可写）；`make user` 追加 `tools/check_user_elf.py` 独立校验段布局；
-  **v0.8 已完成并通过 `make test-driver`（22 项）+ `make test-fat`（21 项）验收**：驱动注册框架（`Driver` trait + 注册表 + `probe_all`）、
+  **v0.8 已完成并通过 `make test-driver`（22 项，v1.0 起为 23 项）+ `make test-fat`（21 项）验收**：驱动注册框架（`Driver` trait + 注册表 + `probe_all`）、
   PCI 枚举（配置机制 #1 + BAR 探测 + 窗口大小）、块设备抽象（按 512 字节扇区读写）、
   **legacy virtio-blk 0.9.5**（virtqueue + 同步轮询 + bounce buffer）、`frame::allocate_contiguous`（DMA 前置条件）、
   **FAT12/16/32 只读后端挂到 VFS**（`/disk` = 启动盘、`/mnt/fat` = 测试盘，syscall 层零改动）与 H-03 `mkfs`
@@ -24,7 +24,8 @@
   （`/bin/hello`，新增 `make test-proc`，8 项 + 4 条正则）；
   `make test-user` 由 32 项增至 **61 项**；`argc/argv` 一并可用；
   同日**第四步：简化网络栈**（virtio-net + Ethernet → ARP → IPv4 → UDP，ARP 解析网关 + DHCP 往返，
-  `make test-network` 13 项）；同日**第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）** —— 新增
+  `make test-network` 13 项；v1.0 又补齐 TCP/socket：内核 TCP 客户端最小集 + `socket`/`bind`/`connect`/`sendto`/`recvfrom` +
+  `/bin/tcpecho` 回显往返，`make test-network` 13 → **23 项**，见 syscall.md 3.13）；同日**第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）** —— 新增
   `getdents`（目录枚举）与 `getprocs`（进程表快照，Cerlesse 扩展号段 256），`/bin` 下四个程序全部可跑
   （`make test-programs`，17 项 + 5 条正则）；同日**第六步：内核侧最小动态链接** ——
   `ET_DYN` 分流 + `PT_INTERP`/`DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`（`make test-dyn` 10 项 +
@@ -366,10 +367,10 @@ panic = "abort"
       （动态链接的**完整**形态 —— 用户态 `ld.so`、版本符号、TLS —— 仍不做，见 architecture.md 第 5 节）
 - [ ] 其余用户程序（cp/mv/rm/mkdir/kill）与 Shell 增强（`cd`、管道、重定向）
       （`ls`/`ps`/`cat`/`echo` 已于 2026-10-11 落地，见上）
-- [ ] TCP（尽力）/ ICMP 与 Socket syscall 最小集（`network/{tcp,socket}.rs` 仍为占位）
+- [x] TCP + Socket syscall 最小集（2026-10-14 落地：`network/tcp.rs` 三次握手/收发/关闭 + `network/socket.rs` 8 槽表 + `socket`/`connect`/`send`/`recv`/`close`；`user/tcpecho` 回显往返；ICMP 仍为占位，见下）
 - [x] 验收：Shell 能启动外部程序（`make test-proc`，2026-10-11）；基础用户程序可跑（`make test-programs`，2026-10-11）；
      网络最小闭环（`make test-network`，2026-10-11）；动态链接最小闭环（`make test-dyn` + `make dyn-hostcheck`，2026-10-11）；
-     ping/HTTP 简例（TCP/ICMP）仍待落地
+     ping（ICMP）仍待落地
 
 ### 5.7 v1.0 — 完整可启动类 Linux 小型 OS
 
@@ -395,6 +396,21 @@ panic = "abort"
 - [ ] 用户/组/权限（`-rwxr-xr-x`、UID/GID）
 - [ ] 进程隔离与 syscall 参数校验强化
 - [ ] 启动链：Kernel → init → Shell → User Programs
+- [x] **驱动兼容性：AHCI/SATA 驱动 + PCI 枚举修缺陷（B-18）**（2026-10-14 落地）
+    - [x] `driver/pci.rs`：头部类型偏移 `0x0C`（cache line size，恒为 0）→ `0x0E` ——
+          多功能设备的 function 1..7 以前**从未被枚举**（q35 上 `enumerated devices=5` → 7，
+          芯片组的 SATA `00:1f.2` / SMBus `00:1f.3` 才可见）；新增命令寄存器读写
+          （`command`/`enable_command`：内存空间 + 总线主控）
+    - [x] `driver/ahci.rs`：AHCI 1.3（命令列表 / 接收 FIS / 命令表 + PRDT、IDENTIFY DEVICE
+          取型号与容量、LBA48 READ/WRITE DMA EXT、`PxCI` 同步轮询、4 KiB bounce buffer）；
+          **按类别匹配**（`0x01`/`0x06`/`0x01`，不看厂商）；没插盘时 `attach` 照样成功并打印 `drives=0`；
+          ATAPI（光驱）按 `PxSIG` 跳过
+    - [x] `main.rs`：有 SATA 盘时对 `ahci0` 再跑一次 **同一个** `block::selftest`
+          （上层 FAT/VFS/CSS 零改动 —— 第二条块设备路径与 virtio-blk 共用一个 trait）
+    - [x] 验收：新增 `make test-ahci`（**24 项**，QEMU 把 `build/fat.img` 插到 ICH9 的 `ide.2`）
+          并入 `test-all`（**19 目标**）；编排场景 `ahci`（**20 场景**）；`test-driver` 23 项
+          （`matched/attached` 由 1 改 2：AHCI 控制器也被认领）；实测 SATA 上挂载的
+          `fs: mount point=/mnt/fat fs=fat32 …` + `fs: disk selftest PASS` 与 virtio 路径结论一致
 - [ ] 文档全量修订、发布 v1.0 tag
 - [ ] 验收：QEMU 一键启动到可交互 Shell
 
@@ -419,6 +435,7 @@ panic = "abort"
 | B-15 | v0.7 | 高 | syscall 入口未恢复 caller-saved 寄存器 → 用户态 `r9` 被破坏，#PF | 入口保存/恢复 `rdi/rsi/rdx/r10/r8/r9` |
 | B-16 | v0.8 | 中 | BAR 窗口大小按 64 位取反，I/O BAR 报出错误尺寸 | 大小在该字**自身位宽**里求 `~mask + 1` |
 | B-17 | v0.8 | 高 | `lba + sectors` 用 `u64` 加法，`lba = MAX-1` 环绕后被误判在容量内 | 改用 `checked_add`，溢出即报错 |
+| B-18 | v1.0 | 高 | PCI 头部类型读在偏移 `0x0C`（cache line size，恒为 0）而非 `0x0E` → `MULTI_FUNCTION` 判据永远为假，**多功能设备的 function 1..7 从未被枚举**：q35 上 `00:1f.0` 的 function 2（SATA/AHCI）与 function 3（SMBus）不在设备表里（固件的引导日志里却有 `Pci(0x1F,0x2)/Sata(...)`） | 偏移改为 `0x0E`；`enumerated devices=5` → 7；新增 `make test-ahci` 把这个 function 变成被断言的设备 |
 
 v0.9 记录的两条踩坑（设计记录，非编号缺陷）：debug 构建下 16 KiB 内核栈静默溢出踩坏 `.bss` 帧分配器；
 子进程退出时必须**先恢复 CR3 再 Drop 地址空间**。详见 [docs/process.md](docs/process.md) 1.4 与
@@ -666,6 +683,7 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 | 2026-10-11 | **CSS-2 落地（VFS 收口）** —— `fs::mount::MountTable` 拆 `backends`/`mounts`（一个后端可被多个挂载点引用，新增 `mount_volume`/`alias_volume`/`umount`/`route`/`sync_counts`），挂载点带 `vol_id`/`options`，挂载/卸载把挂载计数写回卷记录偏移 56；`FileSystem` 增 `caps`/`volume_info`（保守缺省；RAMFS 可写、FAT 只读+大小写不敏感+卷标）；FAT 探测收归 `fs/fat.rs`（`probe`/`probe_sector`/`bp_identity`，删掉 `storage/volume.rs` 里重复的 `probe_fat`），`FatFs::open` 改返回 `OpenError { errno, reason }`；`fs::mount_disks` 按卷表挂载并保留 `/disk`、`/mnt/fat` 兼容点；`fs: stat` 行尾带 `vol=`；新增 `fs::storage_mount_selftest` 开机自测（只读原因来自能力位、后端与记录一致、同一卷多挂载点同字节、卸载后 `ENOENT` 且卷仍在表、`ENOENT`/`EINVAL`/`EEXIST` 反例）与 `storage: mount`/`volcheck`/`unmount` 证据行；`tests/test_boot.py` 增 `--expect-re`（反向引用绑同一 `vol_id`，因为启动盘卷序列号随镜像构建变化）；`make test-storage`（31 项 + 2 正则）、`make test-storage-mbr`（14 项 + 1 正则）、`make test-programs` 的 `mounts=0` → `mounts=1`（记录真的反映挂载表）；不回归：`test-fs`/`test-fat`/`test-user`(91)/`test-driver`(22)/`test-kernel-only`(7)/`check-boundary`/`go-test` 与 17 个编排场景；同步本文件 §5.13/H-08 行、docs/storage.md（2/5/9/10/13 节）、docs/filesystem.md、docs/roadmap.md、docs/README.md、docs/api.md、docs/project-structure.md 与 README |
 | 2026-10-12 | **纯内核化阶段五落地（构建与测试按责任拆分）** —— 归属**用户态**的主机工具全部迁出内核仓库：`tools/pkgmgr/{ckc.py,cpm.py}` + `tests/test_{ckc,cpm}.py` → `userland/pkgmgr/`（新增 `README.md`），`tools/check_user_elf.py` → `userland/tools/`；`tests/orchestrate.json` 用 `tags` 分组（`user`/`ckm`/`shell`/`proc`/`programs`/`dyn` 共 6 个用户态集成场景标 `userland`，其余 13 个为内核场景），`testorch` 新增 `-tag`/`-exclude-tag`（加载期词表校验 + `main_test.go`）；内核 `make test-all` 收敛为**纯内核 18 个目标**（实测全 PASS），新增 `test-all-with-userland`/`test-orch-userland`，`make test-pkg` 改为跨仓库转发（`CERLESSE_USERLAND_DIR` 缺失时明确报错）；用户态侧新增 `make -C userland test-pkg`/`test-all`（实测退出码 0，不需要内核源码）；详见 docs/pure-kernel.md 8.3 与 [userland/pkgmgr/README.md](userland/pkgmgr/README.md) |
 | 2026-10-12 | **CKM-3 落地（事务引擎，主机侧 = H-06 P0b）** —— 新增 `userland/pkgmgr/cpm.py`（纯标准库：目录骨架 + 回执（当前 + `.prev.toml`）+ 事务日志 `txn/<utc>-<pid>.jsonl` + stage/verify/activate/commit + 逆序回滚 + `recover` + `gc` + 单写者锁；**备份与 `activate` 记录都在写目标之前落日志**，因此「写到一半掉电」可恢复；`--fail-after`/`--crash-after` 两个失败注入开关）；`userland/pkgmgr/ckc.py` 拆出 `manifest_from_data`，使**安装期重跑域边界/scope 路径白名单**（`make test-pkg` 既有 `test-ckc` 37 项不变）；新增 `userland/pkgmgr/tests/test_cpm.py` 与 `make test-cpm`（**63 项**，含系统 `tar` 独立复核、逐字节回滚比对、手工拼的越界包零写入、并发锁、去重、`apply` 幂等），`make test-pkg` 改为 `test-ckc + test-cpm`；同步 docs/package-manager.md（11.1 由「待做」改为落地清单 + 12.1 勾选 + 14）、docs/ckm.md（9.3 + 状态 + 第 10 节覆盖情况 + 13）、docs/README.md、tools/README.md、本文件 H-06/H-07 行与 CKM 分期清单的 CKM-3 勾选 |
+| 2026-10-14 | **v1.0 第二步：驱动兼容性（AHCI/SATA + PCI 枚举修缺陷 B-18）** —— `driver/pci.rs` 的头部类型偏移由 `0x0C`（cache line size，恒为 0）改为 `0x0E`：`MULTI_FUNCTION` 判据以前永远为假，**多功能设备的 function 1..7 从未被枚举**（q35 上 `pci: enumerated devices=5` → **7**，芯片组的 SATA `00:1f.2` / SMBus `00:1f.3` 才可见；固件引导日志里一直有 `Pci(0x1F,0x2)/Sata(...)`，两边不一致就是缺陷本身）；新增 `driver/ahci.rs`（AHCI 1.3：命令列表 / 接收 FIS / 命令表 + PRDT、IDENTIFY DEVICE 取型号与容量、LBA48 READ/WRITE DMA EXT、`PxCI` 同步轮询 + 4 KiB bounce buffer、**按类别匹配**不看厂商、ATAPI 按 `PxSIG` 跳过、没插盘时 `attach` 照样成功并打印 `drives=0`）并注册为 `index=2`；`pci.rs` 新增命令寄存器读写（内存空间 + 总线主控），MMIO BAR 第一次被真正用起来；`main.rs` 有 SATA 盘时对 `ahci0` 再跑一次**同一个** `block::selftest`（上层 FAT/VFS/CSS 零改动 —— 第二条块设备路径与 virtio-blk 共用一个 trait）；`tests/test_boot.py` 新增 `--ahci`/`--ahci-disk`（把盘插到 ICH9 的 `ide.2`）；新增 `make test-ahci`（**24 项**）并并入 `test-all`（18 → **19 目标**），编排场景 19 → **20**（新增 `ahci`；`driver` 场景的 `matched/attached` 由 1 改 2）。实测：`make test-ahci` 退出码 0（24/24）、`make test-driver` 23 项 PASS、`testorch driver,ahci` 两场景 PASS（30.1s）；同步 docs/drivers.md（新增 1.9 节 + 2.3 路线 + 驱动列表/限制/证据）、docs/api.md、docs/roadmap.md、docs/README.md、docs/project-structure.md、README.md |
 | 2026-10-12 | **CSS-3 落地（盘符部分）** —— 新增 `kernel/src/storage/letters.rs`（固定容量盘符表：缺省 `C` 给系统卷、其余按 6.5 顺序给 `D`/`E`/…，**自定义**映射持久化到 CKM 状态区键 `storage/letters`，`letter = 0` 取消回到规则；非法 `EINVAL`/占用 `EEXIST`/超容量 `ENOSPC`/未知卷 `ENOENT`）；`storage/registry.rs` 增 `letter_of`/`slot_of`/`assign_letter`/`reassign`（盘符写进卷记录偏移 24）；`syscall/storage.rs` 把 **262 `storage_mount`**（已挂载卷只加别名、flags bit0 只读）/ **263 `storage_unmount`**（卸别名、卸 `/` → `EINVAL`）/ **264 `storage_assign_letter`** 从 ENOSYS 桩上拿下（均走 CKM 判定点 8 `CAP_STORAGE_ADMIN`，参数校验先于能力判定）；`fs::mount_volume_by_id`/`fs::unmount_point`（`fs/mod.rs`）；`userland/libc/src/path.rs` 新增 `is_windows`/`resolve`/`resolve_str`（查 `storage_volumes` 把 `C:\x` 重写为 POSIX）+ 三个 syscall 包装；`userland/user/volumes` 扩为 `list`/`mount`/`unmount`/`letter`/`demo`；内核自测 `letters::selftest`（默认规则/冲突拒绝/持久化往返/取消回退）；`make test-storage` 增 `letter=` 与盘符断言（`letters selftest checks=36`）、`test-storage-mbr`（`checks=22`）、`test-programs` 增 `volumes demo`、`test-ckm` 增零能力拒绝；同步本文件 H-08 行与 §5.13、docs/storage.md（2/4/6/9/10/13 节）、docs/ckm.md、docs/syscall.md（新增 3.12）、docs/api.md、docs/project-structure.md |
 
 
